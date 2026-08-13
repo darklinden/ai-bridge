@@ -15,10 +15,16 @@ mod vision;
 
 use crate::error::Error;
 use crate::forward::AppState;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // Load `.env` before tracing init and config parsing so `Config::from_env`
+    // sees any values it provides. Existing env vars take precedence (dotenv
+    // does not override), and a missing `.env` is not an error.
+    load_dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -63,6 +69,28 @@ async fn main() -> Result<(), Error> {
         .map_err(|e| Error::Server(format!("Server error: {e}")))?;
 
     Ok(())
+}
+
+/// Load `.env` into the process environment, preferring the Cargo manifest
+/// directory (dev: `cargo run`) and falling back to the executable's directory
+/// (deploy). Uses `from_path` (no override) so an already-exported env var wins.
+/// Missing `.env` is silently ignored.
+fn load_dotenv() {
+    let mut candidates = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(".env"));
+        }
+    }
+    for path in candidates {
+        if path.is_file() {
+            match dotenvy::from_path(&path) {
+                Ok(_) => println!("Loaded .env from {}", path.display()),
+                Err(e) => eprintln!("Warning: failed to load .env from {}: {e}", path.display()),
+            }
+            return;
+        }
+    }
 }
 
 async fn shutdown_signal() {
