@@ -247,6 +247,7 @@ where
                                                 "event: content_block_stop\ndata: {}\n\n",
                                                 serde_json::to_string(&event).unwrap_or_default()
                                             );
+                                            open_indices.remove(&prev_index);
                                             yield Ok(Bytes::from(sse_data));
                                         }
 
@@ -784,4 +785,510 @@ fn build_anthropic_usage_from_responses_streaming(usage: Option<&Value>) -> Valu
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reqlog::ReqLog;
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use serde_json::{json, Value};
+    use std::convert::Infallible;
+    use std::io::Error as IoError;
+    use std::io::ErrorKind;
+
+    /// Build a complete SSE block with a named event and JSON data. The block
+    /// must be `\n\n`-terminated since `take_sse_block` frames on the delimiter.
+    fn sse_block(event: &str, value: &Value) -> String {
+        format!(
+            "event: {event}\ndata: {}\n\n",
+            serde_json::to_string(value).unwrap()
+        )
+    }
+
+    /// Feed upstream Responses-API SSE frames into `responses_to_anthropic_sse`,
+    /// collect the output, and parse each block into `(event, data)` pairs.
+    async fn run(frames: Vec<String>) -> Vec<(String, Value)> {
+        let upstream = futures::stream::iter(
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
+        let out = responses_to_anthropic_sse(upstream, "gpt-4o".to_string(), ReqLog::new());
+        let chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let mut text = String::new();
+        for c in &chunks {
+            text.push_str(&String::from_utf8_lossy(c));
+        }
+        text.split("\n\n")
+            .filter(|b| !b.trim().is_empty())
+            .map(|block| {
+                let mut ev = String::new();
+                let mut data = String::new();
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("event: ") {
+                        ev = v.to_string();
+                    } else if let Some(v) = line.strip_prefix("data: ") {
+                        data = v.to_string();
+                    }
+                }
+                (ev, serde_json::from_str(&data).unwrap_or(Value::Null))
+            })
+            .collect()
+    }
+
+    /// Like `run`, but lets a test inject an `Err` chunk mid-stream.
+    async fn run_results(items: Vec<Result<Bytes, IoError>>) -> Vec<(String, Value)> {
+        let upstream = futures::stream::iter(items);
+        let out = responses_to_anthropic_sse(upstream, "gpt-4o".to_string(), ReqLog::new());
+        let chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let mut text = String::new();
+        for c in &chunks {
+            text.push_str(&String::from_utf8_lossy(c));
+        }
+        text.split("\n\n")
+            .filter(|b| !b.trim().is_empty())
+            .map(|block| {
+                let mut ev = String::new();
+                let mut data = String::new();
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("event: ") {
+                        ev = v.to_string();
+                    } else if let Some(v) = line.strip_prefix("data: ") {
+                        data = v.to_string();
+                    }
+                }
+                (ev, serde_json::from_str(&data).unwrap_or(Value::Null))
+            })
+            .collect()
+    }
+
+    fn event_names(events: &[(String, Value)]) -> Vec<&str> {
+        events.iter().map(|(e, _)| e.as_str()).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // State-machine scenario tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn simple_text_stream_full_cycle() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.content_part.added",
+                &json!({"type": "output_text", "item_id": "msg_0", "part_index": 0}),
+            ),
+            sse_block(
+                "response.output_text.delta",
+                &json!({"type": "response.output_text.delta", "item_id": "msg_0", "part_index": 0, "delta": "Hello"}),
+            ),
+            sse_block(
+                "response.output_text.done",
+                &json!({"type": "response.output_text.done", "item_id": "msg_0", "part_index": 0}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "id": "resp_1", "status": "completed", "usage": {"input_tokens": 10, "output_tokens": 5}}),
+            ),
+        ])
+        .await;
+
+        let names = event_names(&events);
+        let expect: Vec<&str> = vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ];
+        assert_eq!(names, expect);
+
+        assert_eq!(events[0].1["message"]["id"], "resp_1");
+        assert_eq!(events[0].1["message"]["model"], "gpt-4o");
+        assert_eq!(events[0].1["message"]["usage"], json!({"input_tokens": 0, "output_tokens": 0}));
+
+        assert_eq!(events[1].1["index"], 0);
+        assert_eq!(events[1].1["content_block"]["type"], "text");
+        assert_eq!(events[2].1["index"], 0);
+        assert_eq!(events[2].1["delta"], json!({"type": "text_delta", "text": "Hello"}));
+
+        assert_eq!(events[4].1["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+        assert!(events[4].1["delta"]["stop_reason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn multi_block_text_auto_closes_previous_block() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.content_part.added",
+                &json!({"type": "output_text", "item_id": "msg_0", "part_index": 0}),
+            ),
+            sse_block(
+                "response.output_text.delta",
+                &json!({"type": "response.output_text.delta", "item_id": "msg_0", "part_index": 0, "delta": "a"}),
+            ),
+            sse_block(
+                "response.content_part.added",
+                &json!({"type": "output_text", "item_id": "msg_1", "part_index": 0}),
+            ),
+            sse_block(
+                "response.output_text.delta",
+                &json!({"type": "response.output_text.delta", "item_id": "msg_1", "part_index": 0, "delta": "b"}),
+            ),
+            sse_block(
+                "response.output_text.done",
+                &json!({"type": "response.output_text.done", "item_id": "msg_1", "part_index": 0}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "id": "resp_1", "status": "completed"}),
+            ),
+        ])
+        .await;
+
+        // `response.content_part.added` auto-closes the previous block (index 0)
+        // and now also drains it from `open_indices`, so the end-of-stream flush
+        // must NOT emit a second `content_block_stop` for it (regression test for
+        // the open_indices leak fix).
+        let names = event_names(&events);
+        let expect: Vec<&str> = vec![
+            "message_start",
+            "content_block_start", // index 0
+            "content_block_delta",
+            "content_block_stop",  // index 0 auto-closed when block 1 starts
+            "content_block_start", // index 1
+            "content_block_delta",
+            "content_block_stop", // index 1 (from output_text.done)
+            "message_delta",
+            "message_stop",
+        ];
+        assert_eq!(names, expect);
+
+        // First stop is index 0, second start is index 1.
+        assert_eq!(events[3].1["index"], 0);
+        assert_eq!(events[4].1["index"], 1);
+        assert_eq!(events[6].1["index"], 1);
+    }
+
+    #[tokio::test]
+    async fn text_delta_for_unknown_key_ignored() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.output_text.delta",
+                &json!({"type": "response.output_text.delta", "item_id": "nope", "part_index": 0, "delta": "ghost"}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+
+        let names = event_names(&events);
+        assert_eq!(names, vec!["message_start", "message_delta", "message_stop"]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_full_cycle() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather"}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"city\":\""}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "\"Paris\"}"}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "function_call", "id": "fc_1"}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+
+        let names = event_names(&events);
+        let expect: Vec<&str> = vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ];
+        assert_eq!(names, expect);
+
+        assert_eq!(
+            events[1].1["content_block"],
+            json!({"type": "tool_use", "id": "call_1", "name": "get_weather"})
+        );
+        assert_eq!(events[1].1["index"], 0);
+        assert_eq!(events[2].1["delta"]["type"], "input_json_delta");
+        assert_eq!(events[3].1["delta"]["type"], "input_json_delta");
+        // Each `partial_json` carries the raw fragment verbatim (streamed
+        // pieces, not accumulated JSON).
+        assert_eq!(events[2].1["delta"]["partial_json"], "{\"city\":\"");
+        assert_eq!(events[3].1["delta"]["partial_json"], "\"Paris\"}");
+        assert_eq!(events[4].1["index"], 0);
+    }
+
+    #[tokio::test]
+    async fn reasoning_full_cycle() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "Let me think"}]}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "reasoning", "id": "rs_1"}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+
+        let names = event_names(&events);
+        let expect: Vec<&str> = vec![
+            "message_start",
+            "content_block_start", // thinking
+            "content_block_delta", // thinking_delta
+            "content_block_delta", // signature_delta
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ];
+        assert_eq!(names, expect);
+
+        assert_eq!(
+            events[1].1["content_block"],
+            json!({"type": "thinking", "thinking": ""})
+        );
+        assert_eq!(events[2].1["delta"]["type"], "thinking_delta");
+        assert_eq!(events[2].1["delta"]["thinking"], "Let me think");
+        assert_eq!(events[3].1["delta"]["type"], "signature_delta");
+        let sig = events[3].1["delta"]["signature"].as_str().unwrap();
+        assert!(sig.starts_with(crate::reasoning_bridge::OPENAI_REASONING_ITEM_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn reasoning_empty_summary_no_deltas() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "reasoning", "id": "rs_1", "summary": []}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "reasoning", "id": "rs_1"}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+
+        let names = event_names(&events);
+        let expect: Vec<&str> = vec![
+            "message_start",
+            "content_block_start",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ];
+        assert_eq!(names, expect);
+    }
+
+    #[tokio::test]
+    async fn message_delta_dedup_first_completed_wins() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "id": "resp_1", "status": "completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "id": "resp_1", "status": "completed", "usage": {"input_tokens": 99, "output_tokens": 99}}),
+            ),
+        ])
+        .await;
+
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|(e, _)| e == "message_delta")
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].1["usage"]["input_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn response_incomplete_sets_max_tokens() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.incomplete",
+                &json!({"type": "response.incomplete", "id": "resp_1", "status": "incomplete", "usage": {"input_tokens": 10, "output_tokens": 5}}),
+            ),
+        ])
+        .await;
+
+        let names = event_names(&events);
+        assert_eq!(names, vec!["message_start", "message_delta", "message_stop"]);
+        let md = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(md.1["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(md.1["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+    }
+
+    #[tokio::test]
+    async fn response_failed_emits_error_and_breaks() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.content_part.added",
+                &json!({"type": "output_text", "item_id": "msg_0", "part_index": 0}),
+            ),
+            sse_block(
+                "response.output_text.delta",
+                &json!({"type": "response.output_text.delta", "item_id": "msg_0", "part_index": 0, "delta": "Hello"}),
+            ),
+            sse_block(
+                "response.failed",
+                &json!({"type": "response.failed", "error": {"code": "server_error", "message": "boom"}}),
+            ),
+        ])
+        .await;
+
+        let names = event_names(&events);
+        assert_eq!(
+            names,
+            vec!["message_start", "content_block_start", "content_block_delta", "error"]
+        );
+        assert_eq!(events[3].1["error"]["type"], "api_error");
+        assert_eq!(events[3].1["error"]["message"], "boom");
+    }
+
+    #[tokio::test]
+    async fn stream_error_yields_stream_error() {
+        let events = run_results(vec![Err(IoError::new(ErrorKind::Other, "boom"))]).await;
+
+        let names = event_names(&events);
+        assert_eq!(names, vec!["error"]);
+        assert_eq!(events[0].1["error"]["type"], "stream_error");
+        assert_eq!(events[0].1["error"]["message"], "Stream error: boom");
+    }
+
+    #[tokio::test]
+    async fn infinite_whitespace_guard_suppresses_delta() {
+        let events = run(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "f"}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": " ".repeat(600)}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "function_call", "id": "fc_1"}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+
+        // The whitespace-only delta must be suppressed by the guard; the block
+        // is still closed normally.
+        assert!(
+            !events
+                .iter()
+                .any(|(e, d)| e == "content_block_delta" && d["delta"]["type"] == "input_json_delta")
+        );
+        let names = event_names(&events);
+        assert_eq!(
+            names,
+            vec!["message_start", "content_block_start", "content_block_stop", "message_delta", "message_stop"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Usage normalization pure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn usage_anthropic_style_with_cache() {
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 5},
+            "cache_read_input_tokens": 40,
+            "cache_creation_input_tokens": 6
+        });
+        let result = build_anthropic_usage_from_responses_streaming(Some(&usage));
+        assert_eq!(result["input_tokens"], 54); // 100 - 40 - 6
+        assert_eq!(result["output_tokens"], 20);
+        assert_eq!(result["cache_read_input_tokens"], 40);
+        assert_eq!(result["cache_creation_input_tokens"], 6);
+    }
+
+    #[test]
+    fn usage_openai_style_maps_prompt_details() {
+        let usage = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 5}
+        });
+        let result = build_anthropic_usage_from_responses_streaming(Some(&usage));
+        assert_eq!(result["input_tokens"], 65); // 100 - 30 - 5
+        assert_eq!(result["output_tokens"], 20);
+        assert_eq!(result["cache_read_input_tokens"], 30);
+        assert_eq!(result["cache_creation_input_tokens"], 5);
+    }
+
+    #[test]
+    fn usage_empty_null_and_non_object_return_zeros() {
+        let zeros = json!({"input_tokens": 0, "output_tokens": 0});
+        assert_eq!(build_anthropic_usage_from_responses_streaming(None), zeros);
+        assert_eq!(
+            build_anthropic_usage_from_responses_streaming(Some(&Value::Null)),
+            zeros
+        );
+        assert_eq!(
+            build_anthropic_usage_from_responses_streaming(Some(&json!({}))),
+            zeros
+        );
+    }
+
+    #[test]
+    fn usage_without_cache_keeps_input_tokens() {
+        let usage = json!({"input_tokens": 100, "output_tokens": 20});
+        let result = build_anthropic_usage_from_responses_streaming(Some(&usage));
+        assert_eq!(result["input_tokens"], 100);
+        assert_eq!(result["output_tokens"], 20);
+        assert!(result.get("cache_read_input_tokens").is_none());
+        assert!(result.get("cache_creation_input_tokens").is_none());
+    }
 }

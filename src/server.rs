@@ -1028,3 +1028,365 @@ fn request_text(body: &Value) -> String {
         None => "(no messages)".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use serde_json::{json, Value};
+
+    fn header(map: &mut HeaderMap, name: &'static str, value: &'static str) {
+        map.insert(name, HeaderValue::from_static(value));
+    }
+
+    // -----------------------------------------------------------------------
+    // authenticate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn authenticate_none_expected_ok() {
+        let headers = HeaderMap::new();
+        assert!(authenticate(&headers, None).is_ok());
+    }
+
+    #[test]
+    fn authenticate_x_api_key_match_ok() {
+        let mut headers = HeaderMap::new();
+        header(&mut headers, "x-api-key", "secret");
+        assert!(authenticate(&headers, Some("secret")).is_ok());
+    }
+
+    #[test]
+    fn authenticate_x_api_key_wrong_err() {
+        let mut headers = HeaderMap::new();
+        header(&mut headers, "x-api-key", "nope");
+        assert!(matches!(
+            authenticate(&headers, Some("secret")),
+            Err(Error::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn authenticate_bearer_match_ok() {
+        let mut headers = HeaderMap::new();
+        header(&mut headers, "authorization", "Bearer secret");
+        assert!(authenticate(&headers, Some("secret")).is_ok());
+    }
+
+    #[test]
+    fn authenticate_bearer_wrong_err() {
+        let mut headers = HeaderMap::new();
+        header(&mut headers, "authorization", "Bearer nope");
+        assert!(matches!(
+            authenticate(&headers, Some("secret")),
+            Err(Error::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn authenticate_missing_headers_err() {
+        let headers = HeaderMap::new();
+        assert!(matches!(
+            authenticate(&headers, Some("secret")),
+            Err(Error::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn authenticate_x_api_key_takes_precedence_over_bearer() {
+        // `x-api-key` wins via `or_else`, so a wrong x-api-key still fails even
+        // when the Bearer token is correct.
+        let mut headers = HeaderMap::new();
+        header(&mut headers, "x-api-key", "wrong");
+        header(&mut headers, "authorization", "Bearer secret");
+        assert!(matches!(
+            authenticate(&headers, Some("secret")),
+            Err(Error::Unauthorized(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Text utilities
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn single_line_collapses_whitespace() {
+        assert_eq!(single_line("a  b\nc\td"), "a b c d");
+        assert_eq!(single_line(""), "");
+        assert_eq!(single_line("  leading and trailing  "), "leading and trailing");
+        assert_eq!(single_line("already"), "already");
+    }
+
+    #[test]
+    fn tool_use_summary_variants() {
+        assert_eq!(tool_use_summary(&json!({"name": "f", "input": {}})), "[tool_use: f] {}");
+        assert_eq!(tool_use_summary(&json!({"name": "f"})), "[tool_use: f]");
+        assert_eq!(
+            tool_use_summary(&json!({"name": "f", "input": {"a": 1}})),
+            "[tool_use: f] {\"a\":1}"
+        );
+        assert_eq!(tool_use_summary(&json!({"input": {}})), "[tool_use: ?] {}");
+        // Empty-string input serializes to `""` (non-empty), so it is appended.
+        assert_eq!(tool_use_summary(&json!({"name": "f", "input": ""})), "[tool_use: f] \"\"");
+    }
+
+    #[test]
+    fn tool_result_summary_variants() {
+        assert_eq!(
+            tool_result_summary(&json!({"tool_use_id": "t_1", "content": "out"})),
+            "[tool_result: t_1] out"
+        );
+        assert_eq!(
+            tool_result_summary(&json!({"tool_use_id": "t_1", "content": ""})),
+            "[tool_result: t_1]"
+        );
+        // Array content goes through extract_text_content; empty array -> `[empty]`.
+        assert_eq!(
+            tool_result_summary(&json!({"tool_use_id": "t_1", "content": []})),
+            "[tool_result: t_1] [empty]"
+        );
+        assert_eq!(
+            tool_result_summary(&json!({"content": "x"})),
+            "[tool_result: ?] x"
+        );
+        // Non-string/array content -> "/".
+        assert_eq!(
+            tool_result_summary(&json!({"tool_use_id": "t_1", "content": null})),
+            "[tool_result: t_1] /"
+        );
+    }
+
+    #[test]
+    fn extract_text_content_variants() {
+        assert_eq!(extract_text_content(Some(&json!("hello"))), "hello");
+
+        let blocks = json!([
+            {"type": "text", "text": "a"},
+            {"type": "thinking", "thinking": "b"},
+            {"type": "image"},
+            {"type": "document"},
+            {"type": "tool_use", "name": "f", "input": {"x": 1}},
+            {"type": "tool_result", "tool_use_id": "t", "content": "out"}
+        ]);
+        assert_eq!(
+            extract_text_content(Some(&blocks)),
+            "a b (thinking) [image] [document] [tool_use: f] {\"x\":1} [tool_result: t] out"
+        );
+
+        assert_eq!(extract_text_content(Some(&json!([]))), "[empty]");
+        assert_eq!(extract_text_content(None), "null");
+        assert_eq!(extract_text_content(Some(&Value::Null)), "null");
+        assert_eq!(extract_text_content(Some(&json!(42))), "42");
+    }
+
+    #[test]
+    fn extract_openai_chat_text_variants() {
+        assert_eq!(extract_openai_chat_text(Some(&json!("hi"))), "hi");
+
+        let parts = json!([
+            {"type": "text", "text": "a"},
+            {"type": "input_text", "text": "b"},
+            {"type": "output_text", "text": "c"},
+            {"type": "image_url"},
+            {"type": "input_image"},
+            {"type": "other", "text": "ignored"}
+        ]);
+        assert_eq!(extract_openai_chat_text(Some(&parts)), "a b c [image] [image]");
+
+        assert_eq!(extract_openai_chat_text(None), "(no content)");
+        assert_eq!(extract_openai_chat_text(Some(&Value::Null)), "(no content)");
+        assert_eq!(extract_openai_chat_text(Some(&json!([]))), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // System / request extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_system_combines_top_level_and_messages() {
+        let body = json!({
+            "system": "top",
+            "messages": [{"role": "system", "content": "msg"}]
+        });
+        let msgs = body.get("messages").and_then(|m| m.as_array());
+        assert_eq!(
+            extract_system(&body, msgs.map(|v| v.as_slice())),
+            Some("top | msg".to_string())
+        );
+
+        let only_msg = json!({
+            "messages": [{"role": "system", "content": "msg"}, {"role": "user", "content": "hi"}]
+        });
+        let msgs = only_msg.get("messages").and_then(|m| m.as_array());
+        assert_eq!(
+            extract_system(&only_msg, msgs.map(|v| v.as_slice())),
+            Some("msg".to_string())
+        );
+
+        let none = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let msgs = none.get("messages").and_then(|m| m.as_array());
+        assert_eq!(extract_system(&none, msgs.map(|v| v.as_slice())), None);
+    }
+
+    #[test]
+    fn request_text_last_user_or_fallback() {
+        // Last user message wins, whitespace collapsed.
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "last  user\nline"}
+            ]
+        });
+        assert_eq!(request_text(&body), "last user line");
+
+        // No user message: join all messages.
+        let no_user = json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "assistant", "content": "reply"}
+            ]
+        });
+        assert_eq!(request_text(&no_user), "sys | reply");
+
+        // User content empty -> "(no messages)".
+        let empty_user = json!({"messages": [{"role": "user", "content": "  "}]});
+        assert_eq!(request_text(&empty_user), "(no messages)");
+
+        // No messages key -> "(no messages)".
+        assert_eq!(request_text(&json!({"system": "x"})), "(no messages)");
+    }
+
+    #[test]
+    fn extract_system_for_entry_variants() {
+        let anthropic = json!({
+            "system": "top",
+            "messages": [{"role": "system", "content": "msg"}]
+        });
+        assert_eq!(
+            extract_system_for_entry(&anthropic, LocalEntry::AnthropicMessages),
+            Some("top | msg".to_string())
+        );
+
+        let chat = json!({
+            "messages": [
+                {"role": "system", "content": "s1"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        assert_eq!(
+            extract_system_for_entry(&chat, LocalEntry::OaiChat),
+            Some("s1".to_string())
+        );
+
+        let responses = json!({
+            "instructions": "inst",
+            "input": [
+                {"type": "message", "role": "system", "content": "s2"},
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+        assert_eq!(
+            extract_system_for_entry(&responses, LocalEntry::OaiResponses),
+            Some("inst | s2".to_string())
+        );
+    }
+
+    #[test]
+    fn request_text_for_entry_variants() {
+        let anthropic = json!({
+            "messages": [{"role": "user", "content": "hello  world"}]
+        });
+        assert_eq!(
+            request_text_for_entry(&anthropic, LocalEntry::AnthropicMessages),
+            "hello world"
+        );
+
+        let chat = json!({
+            "messages": [
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "hi there"}
+            ]
+        });
+        assert_eq!(request_text_for_entry(&chat, LocalEntry::OaiChat), "hi there");
+
+        let responses = json!({
+            "input": [
+                {"type": "message", "role": "assistant", "content": "reply"},
+                {"type": "message", "role": "user", "content": "hi responses"}
+            ]
+        });
+        assert_eq!(
+            request_text_for_entry(&responses, LocalEntry::OaiResponses),
+            "hi responses"
+        );
+
+        // OaiResponses with no user message -> "(no messages)".
+        let no_user = json!({
+            "input": [{"type": "message", "role": "assistant", "content": "reply"}]
+        });
+        assert_eq!(
+            request_text_for_entry(&no_user, LocalEntry::OaiResponses),
+            "(no messages)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Response shaping
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upstream_error_response_anthropic_shape() {
+        let resp = upstream_error_response(
+            StatusCode::BAD_GATEWAY,
+            json!({"error": {"message": "boom"}}),
+            LocalEntry::AnthropicMessages,
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            json!({"type": "error", "error": {"type": "api_error", "message": "boom"}})
+        );
+
+        // Missing `error.message` falls back to a default message.
+        let resp = upstream_error_response(
+            StatusCode::BAD_GATEWAY,
+            json!({}),
+            LocalEntry::AnthropicMessages,
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["message"], "Upstream request failed");
+    }
+
+    #[tokio::test]
+    async fn upstream_error_response_openai_shape() {
+        for entry in [LocalEntry::OaiChat, LocalEntry::OaiResponses] {
+            let resp = upstream_error_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": {"message": "boom"}}),
+                entry,
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body,
+                json!({"error": {"message": "boom", "type": "upstream_error"}})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_response_sets_streaming_headers() {
+        let resp = sse_response(Body::from(""));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(resp.headers().get("Cache-Control").unwrap(), "no-cache");
+    }
+}
