@@ -13,7 +13,7 @@ pub(crate) const WHOLE_DATA_URL_MIN_BYTES: usize = 8 * 1024;
 pub(crate) const TOOL_RESULT_MEDIA_MOVED_MARKER: &str =
     "[cc-switch: tool result media moved to the following user message]";
 const BASE64ISH_MIN_BYTES: usize = 16 * 1024;
-const MAX_MEDIA_TRAVERSAL_DEPTH: usize = 32;
+pub(crate) const MAX_MEDIA_TRAVERSAL_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
