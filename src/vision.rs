@@ -9,6 +9,12 @@
 //! Behavior:
 //! - All images in one request are analyzed together in a single non-streaming
 //!   vision call (multi-image joint analysis).
+//! - Prompt selection: `VISION_PROMPT` (custom) wins, else `VISION_PROMPT_MODE`
+//!   selects a built-in template (`auto` | `general` | `ui` | `compact`,
+//!   default `auto`); `VISION_MAX_TOKENS` caps the vision output.
+//! - Each image is labeled by its true 1-based document index (`[Image N]`)
+//!   with an injected text part before its image block, so partial-cache calls
+//!   keep the correct mapping.
 //! - Descriptions are cached in-process keyed by image fingerprint with a TTL.
 //! - A vision failure degrades to the `[Unsupported Image]` placeholder and does
 //!   not block the request (the main upstream is unaffected).
@@ -121,7 +127,7 @@ pub async fn describe_images_in_body(
 
     // Joint analysis: one vision call describing all uncached images together.
     if !uncached.is_empty() {
-        let vision_request = build_vision_request(&images, &uncached, vision);
+        let vision_request = build_vision_request(&uncached, vision);
         let description = call_vision(vision_request, state, vision).await;
 
         match description {
@@ -318,22 +324,112 @@ fn image_slot_part(value: &Value) -> Option<Value> {
     .or_else(|| image_to_content_part(value))
 }
 
+// Description prompt templates, adapted from the `vision-skill` read-image
+// script. All are multi-image aware: the vision call labels each image with a
+// `[Image N]` text part (see build_vision_request), and the model is told to
+// open every per-image section with the same `[Image N]` heading so the text
+// stays mappable to document positions. The "keep the original language"
+// clause refers to transcribed on-screen text, not the prompt itself.
+//
+// `auto` is the default: it lets the vision model self-route each image (UI
+// screenshot → UI structure, otherwise → General structure) in a single call.
+
+const PROMPT_AUTO: &str = r#"You are a rigorous, exhaustive image description engine. Each image below will be replaced into a text-only LLM that cannot see the original — your output is that model's entire knowledge of the image, so it must be complete and faithful.
+
+Every image below is preceded by a label such as [Image N]. For EACH image, output a Markdown section that begins with the SAME [Image N] heading.
+
+First judge the image type, then use the matching structure:
+- If it is a UI screenshot (web page, app, desktop software, terminal, etc.) → use the UI Reconstruction structure;
+- Otherwise (photo, document, table, chart, illustration, diagram, etc.) → use the General Description structure.
+
+UI Reconstruction:
+1. Layout structure: overall composition, grid/alignment, light/dark theme;
+2. Component inventory: hierarchical list of navigation/cards/buttons/inputs/labels/lists/modals, noting relative position;
+3. Text: transcribe all visible text verbatim (keep the original language) and state which component it belongs to;
+4. Visual state: color scheme, selection/disabled/warning states, icon semantics;
+5. Interaction hints: clickable regions, form fields, button behavior (when determinable);
+6. Uncertainty: honestly describe any blurry or ambiguous regions.
+
+General Description:
+1. Overview: image type, subject, background, aspect ratio, dominant colors, light/dark;
+2. Text content: if text is visible, transcribe it verbatim (keep the original language) and note its position;
+3. Layout and space: describe element organization, grouping, alignment, nesting, top to bottom and left to right;
+4. Visual details: icons, shapes, numbers, color meanings, status indicators, highlights;
+5. Summary: one or two sentences capturing the core information.
+
+Common requirements: output in Markdown; wrap text/keywords in backticks; if something cannot be made out, honestly write "cannot make out" — never fabricate or guess; write more rather than less. When there are multiple images, after the per-image sections, briefly note how the images relate to one another."#;
+
+const PROMPT_UI: &str = r#"These are UI interface screenshots. Generate a UI reconstruction guide for each so a text-only AI can understand the interface without seeing the original image.
+
+Every image below is preceded by a label such as [Image N]. For EACH image, output a Markdown section that begins with the SAME [Image N] heading:
+
+1. Layout structure: overall composition, grid and alignment, light/dark theme;
+2. Component inventory: hierarchical list of navigation/cards/buttons/inputs/labels/lists/modals, noting relative position;
+3. Text: transcribe all visible text verbatim (keep the original language), wrapped in backticks, and state the component it belongs to;
+4. Visual state: color scheme, light/dark theme, selected/disabled/warning states, icon semantics;
+5. Interaction hints: clickable regions, form fields, button behavior (when determinable);
+6. Uncertainty: honestly describe any blurry or ambiguous regions.
+
+Goal: faithful reconstruction — do not infer, do not embellish. When there are multiple screenshots, also briefly note how they relate to one another (e.g. same flow, before/after, parent/child)."#;
+
+const PROMPT_GENERAL: &str = r#"You are a rigorous, exhaustive image description engine. Each image below will be replaced into a text-only LLM that cannot see the original — your description must be complete and faithful.
+
+Every image below is preceded by a label such as [Image N]. For EACH image, output a Markdown section that begins with the SAME [Image N] heading, using this structure:
+
+## [Image N]
+### Overview
+Image type (photo/document/chart/illustration/diagram/other), subject, background, aspect ratio, dominant colors, light/dark theme.
+
+### Text content
+If visible text exists, transcribe it verbatim (keep the original language), wrapped in backticks, and note its position (e.g. "top-center title: `xxx`").
+
+### Layout and spatial relationships
+Describe element organization from top to bottom and left to right; note grouping, alignment, nesting.
+
+### Visual details
+Icons, shapes, numbers, color meanings, status indicators, highlights, etc.
+
+### Summary
+One or two sentences capturing the core information.
+
+Requirements: highlight key information with backticks; honestly write "cannot make out" for anything blurry or unreadable — never fabricate; write more rather than less. When there are multiple images, also briefly note how they relate to one another."#;
+
+const PROMPT_COMPACT: &str = r#"Describe each image in detail for another AI that cannot see the original.
+
+Every image below is preceded by a label such as [Image N]. For EACH image, output a Markdown section that begins with the SAME [Image N] heading:
+1) Transcribe all visible text verbatim (keep the original language); 2) describe the layout and the position of each element; 3) describe icons, colors, numbers and other details;
+4) if something cannot be made out, write "cannot make out" — do not fabricate.
+Use Markdown bullet points; the more information the better. When there are multiple images, also briefly note how they relate to one another."#;
+
+/// Choose the description prompt: custom (`VISION_PROMPT`) wins, else the
+/// mode template (`VISION_PROMPT_MODE`), else the auto-routing default.
+fn select_prompt(vision: &VisionConfig) -> &str {
+    if let Some(custom) = vision.custom_prompt.as_deref() {
+        return custom;
+    }
+    match vision.prompt_mode.as_str() {
+        "general" => PROMPT_GENERAL,
+        "ui" => PROMPT_UI,
+        "compact" => PROMPT_COMPACT,
+        _ => PROMPT_AUTO,
+    }
+}
+
 /// Build a joint vision request describing all images at once.
 fn build_vision_request(
-    _all_images: &[Value],
     uncached: &[(usize, u64, &Value)],
     vision: &VisionConfig,
 ) -> Value {
-    // Describe the uncached subset in one prompt, in order.
-    let mut content: Vec<Value> = Vec::with_capacity(uncached.len() + 1);
-    content.push(json!({
-        "type": "text",
-        "text": "Describe each of these images concisely. For each image, describe \
-                 its content, any visible text, and how the images relate to each \
-                 other. Prefix each description with [Image N]."
-    }));
-    for (_, _, block) in uncached {
+    let prompt = select_prompt(vision);
+    // Prompt text + a `[Image N]` label text part before each image, so the
+    // model numbers every section by its TRUE 1-based document position. This
+    // stays correct when part of a request was served from cache and the
+    // uncached indices are non-contiguous.
+    let mut content: Vec<Value> = Vec::with_capacity(uncached.len() * 2 + 1);
+    content.push(json!({ "type": "text", "text": prompt }));
+    for (i, _, block) in uncached {
         if let Some(part) = image_to_content_part(block) {
+            content.push(json!({ "type": "text", "text": format!("[Image {}]", i + 1) }));
             content.push(part);
         }
     }
@@ -341,20 +437,30 @@ fn build_vision_request(
     match vision.upstream_type {
         crate::forward::UpstreamType::AnthropicMessages => json!({
             "model": vision.model,
-            "max_tokens": 1024,
+            "max_tokens": vision.max_tokens.unwrap_or(1024),
             "messages": [{
                 "role": "user",
                 "content": content
             }]
         }),
-        _ => json!({
-            "model": vision.model,
-            "messages": [{
-                "role": "user",
-                "content": content
-            }],
-            "stream": false
-        }),
+        _ => {
+            // Chat shape for both OaiChat and OaiResponses (existing behavior,
+            // intentionally unchanged — including the field name: this arm
+            // speaks Chat, so the token cap is `max_tokens`, not
+            // `max_output_tokens`). Emitted only when configured.
+            let mut request = json!({
+                "model": vision.model,
+                "messages": [{
+                    "role": "user",
+                    "content": content
+                }],
+                "stream": false
+            });
+            if let Some(limit) = vision.max_tokens {
+                request["max_tokens"] = json!(limit);
+            }
+            request
+        }
     }
 }
 
@@ -459,6 +565,7 @@ async fn call_vision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::UpstreamType;
     use crate::tool_media::plan_chat_tool_output_media;
 
     fn image_block() -> Value {
@@ -482,6 +589,38 @@ mod tests {
 
     fn anthropic_body(content: Value) -> Value {
         json!({ "model": "claude-sonnet-5", "messages": [{"role": "user", "content": content}] })
+    }
+
+    fn vision_config(
+        ut: UpstreamType,
+        mode: &str,
+        custom: Option<&str>,
+        max_tokens: Option<u32>,
+    ) -> VisionConfig {
+        VisionConfig {
+            url: "http://vision".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            upstream_type: ut,
+            override_headers: http::HeaderMap::new(),
+            prompt_mode: mode.into(),
+            custom_prompt: custom.map(str::to_string),
+            max_tokens,
+        }
+    }
+
+    fn image_url_part(url: &str) -> Value {
+        json!({ "type": "image_url", "image_url": { "url": url } })
+    }
+
+    /// Build a request and return (request, first-message content array).
+    fn request_for(
+        uncached: &[(usize, u64, &Value)],
+        vision: &VisionConfig,
+    ) -> (Value, Vec<Value>) {
+        let req = build_vision_request(uncached, vision);
+        let content = req["messages"][0]["content"].as_array().unwrap().clone();
+        (req, content)
     }
 
     #[test]
@@ -682,6 +821,104 @@ mod tests {
         let messages = chat["messages"].as_array().unwrap();
         for m in messages {
             assert_ne!(m["role"], "user", "synthetic user message leaked: {serialized}");
+        }
+    }
+
+    #[test]
+    fn prompt_custom_overrides_everything() {
+        let img = image_url_part("data:image/png;base64,AAA");
+        let cfg = vision_config(UpstreamType::OaiChat, "ui", Some("my custom prompt"), None);
+        let uncached = [(0, 0, &img)];
+        let (_, content) = request_for(&uncached, &cfg);
+        assert_eq!(content[0]["text"], "my custom prompt");
+    }
+
+    #[test]
+    fn prompt_mode_selects_template() {
+        let cases = [
+            ("general", PROMPT_GENERAL),
+            ("ui", PROMPT_UI),
+            ("compact", PROMPT_COMPACT),
+            ("auto", PROMPT_AUTO),
+        ];
+        for (mode, expected) in cases {
+            let img = image_url_part("data:image/png;base64,AAA");
+            let cfg = vision_config(UpstreamType::OaiChat, mode, None, None);
+            let uncached = [(0, 0, &img)];
+            let (_, content) = request_for(&uncached, &cfg);
+            assert_eq!(content[0]["text"], expected, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn prompt_unknown_mode_falls_back_to_auto() {
+        let img = image_url_part("data:image/png;base64,AAA");
+        let cfg = vision_config(UpstreamType::OaiChat, "bogus", None, None);
+        let uncached = [(0, 0, &img)];
+        let (_, content) = request_for(&uncached, &cfg);
+        assert_eq!(content[0]["text"], PROMPT_AUTO);
+    }
+
+    #[test]
+    fn labels_use_true_document_indices() {
+        let img1 = image_url_part("data:image/png;base64,AAA");
+        let img2 = image_url_part("data:image/png;base64,BBB");
+        // 0-based document positions 4 and 8 → labels [Image 5] and [Image 9].
+        let uncached = [(4, 1, &img1), (8, 2, &img2)];
+        let cfg = vision_config(UpstreamType::OaiChat, "auto", None, None);
+        let (_, content) = request_for(&uncached, &cfg);
+        assert_eq!(content[1]["text"], "[Image 5]");
+        assert_eq!(content[2], img1);
+        assert_eq!(content[3]["text"], "[Image 9]");
+        assert_eq!(content[4], img2);
+    }
+
+    #[test]
+    fn labels_interleave_even_for_adjacent_images() {
+        let img1 = image_url_part("data:image/png;base64,AAA");
+        let img2 = image_url_part("data:image/png;base64,BBB");
+        let uncached = [(0, 1, &img1), (1, 2, &img2)];
+        let cfg = vision_config(UpstreamType::OaiChat, "auto", None, None);
+        let (_, content) = request_for(&uncached, &cfg);
+        assert_eq!(content[1]["text"], "[Image 1]");
+        assert_eq!(content[2], img1);
+        assert_eq!(content[3]["text"], "[Image 2]");
+        assert_eq!(content[4], img2);
+    }
+
+    #[test]
+    fn anthropic_max_tokens_config_or_default() {
+        let img = image_url_part("data:image/png;base64,AAA");
+        let uncached = [(0, 0, &img)];
+
+        let cfg = vision_config(UpstreamType::AnthropicMessages, "auto", None, Some(2048));
+        let (req, _) = request_for(&uncached, &cfg);
+        assert_eq!(req["max_tokens"], 2048);
+        assert!(req.get("stream").is_none(), "anthropic arm emits no stream");
+        assert!(req["messages"][0]["content"].is_array());
+
+        let cfg = vision_config(UpstreamType::AnthropicMessages, "auto", None, None);
+        let (req, _) = request_for(&uncached, &cfg);
+        assert_eq!(req["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn chat_max_tokens_only_when_configured() {
+        let img = image_url_part("data:image/png;base64,AAA");
+        let uncached = [(0, 0, &img)];
+
+        // OaiChat and OaiResponses share the same `_` arm, so both behave
+        // identically: Chat field `max_tokens`, emitted only when configured.
+        for ut in [UpstreamType::OaiChat, UpstreamType::OaiResponses] {
+            let cfg = vision_config(ut, "auto", None, Some(512));
+            let (req, _) = request_for(&uncached, &cfg);
+            assert_eq!(req["max_tokens"], 512);
+            assert_eq!(req["stream"], false);
+
+            let cfg = vision_config(ut, "auto", None, None);
+            let (req, _) = request_for(&uncached, &cfg);
+            assert!(req.get("max_tokens").is_none());
+            assert_eq!(req["stream"], false);
         }
     }
 }

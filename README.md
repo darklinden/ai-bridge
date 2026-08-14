@@ -84,6 +84,9 @@ All configuration is via environment variables (or `.env`). The upstream format 
 | `LISTEN_PORT` | | `18650` | Bind port. |
 | `VISION_URL` / `VISION_API_KEY` / `VISION_MODEL` | | *(unset)* | Vision model config (all three required to enable). Endpoint format is detected from the URL (`/responses`, `/messages`, else chat). |
 | `VISION_HEADERS` | | *(none)* | Extra headers for vision requests, same format as `UPSTREAM_HEADERS`. |
+| `VISION_PROMPT_MODE` | | `auto` | Vision description prompt template: `auto` (self-routes UI vs general), `general`, `ui`, or `compact`. Unknown values fall back to `auto`. Ignored when `VISION_PROMPT` is set. |
+| `VISION_PROMPT` | | *(none)* | Custom vision description prompt; overrides `VISION_PROMPT_MODE`. Each image is labeled `[Image N]`; mention the labels in a custom prompt. |
+| `VISION_MAX_TOKENS` | | *(omitted)* | Output token cap for the vision call. Empty/0/invalid = omitted. |
 | `RUST_LOG` | | `info` | `tracing` filter, e.g. `debug`, `warn`, or `ai_bridge=trace`. |
 
 ### Legacy variables are rejected
@@ -145,7 +148,7 @@ Each request/response pair is printed to stdout as single-line records, independ
 
 When the upstream model is confirmed text-only, image blocks are preprocessed before forwarding:
 
-- If a vision model is configured (`VISION_URL` + `VISION_API_KEY` + `VISION_MODEL`), all images in the request are described in a single non-streaming vision call and the image blocks are replaced with the resulting text. Results are cached in-process keyed by image fingerprint with a TTL; a vision failure degrades to `[Unsupported Image]` and never blocks the request.
+- If a vision model is configured (`VISION_URL` + `VISION_API_KEY` + `VISION_MODEL`), all images in the request are described in a single non-streaming vision call and the image blocks are replaced with the resulting text. Descriptions come from a built-in prompt template selected by `VISION_PROMPT_MODE` (`auto` self-routes UI screenshots to a UI-reconstruction structure and other images to a general structure), or from a custom `VISION_PROMPT`; `VISION_MAX_TOKENS` caps the description length. Each image is labeled by its document position (`[Image N]`), which stays correct when only a subset of images is uncached. Results are cached in-process keyed by image fingerprint with a TTL; a vision failure degrades to `[Unsupported Image]` and never blocks the request.
 - Otherwise images are stripped and replaced with an `[Unsupported Image]` placeholder.
 
 The request log notes handled images, e.g. `[media: 2 image(s) → [Unsupported Image]]`.

@@ -34,6 +34,13 @@ pub(crate) struct VisionConfig {
     pub(crate) upstream_type: UpstreamType,
     /// Headers from `VISION_HEADERS` overridden on every vision request.
     pub(crate) override_headers: HeaderMap,
+    /// Prompt template mode: "auto" (default) | "general" | "ui" | "compact".
+    /// Normalized at parse time; unknown values fall back to "auto".
+    pub(crate) prompt_mode: String,
+    /// Custom description prompt from `VISION_PROMPT`; overrides `prompt_mode`.
+    pub(crate) custom_prompt: Option<String>,
+    /// Output token cap from `VISION_MAX_TOKENS`; None = omit. 0/empty/invalid → None.
+    pub(crate) max_tokens: Option<u32>,
 }
 
 /// Configuration for forwarding requests to the configured upstream API.
@@ -129,9 +136,18 @@ fn reject_legacy_env() -> Result<(), Error> {
 /// Parse the optional `VISION_*` config. Returns `None` when any required piece
 /// is absent — vision is strictly additive and never falls back to the upstream.
 fn parse_vision_config() -> Result<Option<VisionConfig>, Error> {
-    let url = std::env::var("VISION_URL").ok();
-    let api_key = std::env::var("VISION_API_KEY").ok();
-    let model = std::env::var("VISION_MODEL").ok();
+    parse_vision_config_with(|name| std::env::var(name).ok())
+}
+
+/// Pure variant of [`parse_vision_config`] taking a name→value lookup so tests
+/// can exercise parsing without mutating process env (which would race under
+/// parallel `cargo test`).
+fn parse_vision_config_with(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<VisionConfig>, Error> {
+    let url = env("VISION_URL");
+    let api_key = env("VISION_API_KEY");
+    let model = env("VISION_MODEL");
 
     let Some(url) = url else {
         return Ok(None);
@@ -156,7 +172,40 @@ fn parse_vision_config() -> Result<Option<VisionConfig>, Error> {
     };
 
     let override_headers =
-        parse_header_overrides(&std::env::var("VISION_HEADERS").unwrap_or_default());
+        parse_header_overrides(&env("VISION_HEADERS").unwrap_or_default());
+
+    // Prompt mode: trim + lowercase; unknown → "auto" with a one-time startup
+    // warning. Vision tuning is optional, so a bad value never blocks startup.
+    let prompt_mode = env("VISION_PROMPT_MODE").unwrap_or_default();
+    let prompt_mode = prompt_mode.trim().to_ascii_lowercase();
+    let prompt_mode = match prompt_mode.as_str() {
+        "auto" | "general" | "ui" | "compact" => prompt_mode,
+        other => {
+            tracing::warn!(
+                "[VISION_PROMPT_MODE] Unknown mode \"{other}\", falling back to \"auto\""
+            );
+            "auto".to_string()
+        }
+    };
+
+    // Custom prompt: present and non-blank wins over the mode template.
+    let custom_prompt = env("VISION_PROMPT").filter(|p| !p.trim().is_empty());
+
+    // Max tokens: empty/0/invalid → None (omit), matching the reference
+    // script's "0 = omit" semantics for EXPLAIN_MAX_TOKENS.
+    let max_tokens = match env("VISION_MAX_TOKENS") {
+        Some(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u32>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    "[VISION_MAX_TOKENS] Invalid value \"{raw}\", omitting max_tokens"
+                );
+                None
+            }
+        },
+        _ => None,
+    };
 
     Ok(Some(VisionConfig {
         url,
@@ -164,6 +213,9 @@ fn parse_vision_config() -> Result<Option<VisionConfig>, Error> {
         model,
         upstream_type,
         override_headers,
+        prompt_mode,
+        custom_prompt,
+        max_tokens,
     }))
 }
 
@@ -417,7 +469,8 @@ pub(crate) async fn forward_to_responses_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_header_overrides, UpstreamType};
+    use super::{parse_header_overrides, parse_vision_config_with, UpstreamType};
+    use std::collections::HashMap;
 
     #[test]
     fn upstream_type_accepts_all_three_values() {
@@ -500,5 +553,109 @@ mod tests {
         let headers = parse_header_overrides("X:1|X:2");
         assert_eq!(headers.len(), 1);
         assert_eq!(headers.get("x").unwrap(), "2");
+    }
+
+    fn env_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn parse_with(map: &HashMap<String, String>) -> Option<super::VisionConfig> {
+        parse_vision_config_with(|name| map.get(name).cloned())
+            .expect("parse_vision_config_with should not error")
+    }
+
+    #[test]
+    fn parse_vision_config_parses_full_config() {
+        let map = env_map(&[
+            ("VISION_URL", "http://vision/v1/chat/completions"),
+            ("VISION_API_KEY", "k"),
+            ("VISION_MODEL", "m"),
+            ("VISION_PROMPT_MODE", "compact"),
+            ("VISION_PROMPT", "custom"),
+            ("VISION_MAX_TOKENS", "2048"),
+        ]);
+        let cfg = parse_with(&map).expect("full config parses");
+        assert_eq!(cfg.prompt_mode, "compact");
+        assert_eq!(cfg.custom_prompt.as_deref(), Some("custom"));
+        assert_eq!(cfg.max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn parse_vision_config_defaults_prompt_mode_to_auto() {
+        let map = env_map(&[
+            ("VISION_URL", "http://vision/v1/chat/completions"),
+            ("VISION_API_KEY", "k"),
+            ("VISION_MODEL", "m"),
+        ]);
+        let cfg = parse_with(&map).unwrap();
+        assert_eq!(cfg.prompt_mode, "auto");
+        assert_eq!(cfg.custom_prompt, None);
+        assert_eq!(cfg.max_tokens, None);
+    }
+
+    #[test]
+    fn parse_vision_config_unknown_prompt_mode_falls_back_to_auto() {
+        let map = env_map(&[
+            ("VISION_URL", "http://vision/v1/chat/completions"),
+            ("VISION_API_KEY", "k"),
+            ("VISION_MODEL", "m"),
+            ("VISION_PROMPT_MODE", "bogus"),
+        ]);
+        let cfg = parse_with(&map).unwrap();
+        assert_eq!(cfg.prompt_mode, "auto");
+
+        // Case-insensitive and trimmed values are accepted.
+        let map = env_map(&[
+            ("VISION_URL", "http://vision/v1/chat/completions"),
+            ("VISION_API_KEY", "k"),
+            ("VISION_MODEL", "m"),
+            ("VISION_PROMPT_MODE", "  UI  "),
+        ]);
+        let cfg = parse_with(&map).unwrap();
+        assert_eq!(cfg.prompt_mode, "ui");
+    }
+
+    #[test]
+    fn parse_vision_config_blank_custom_prompt_is_none() {
+        let map = env_map(&[
+            ("VISION_URL", "http://vision/v1/chat/completions"),
+            ("VISION_API_KEY", "k"),
+            ("VISION_MODEL", "m"),
+            ("VISION_PROMPT", "   "),
+        ]);
+        let cfg = parse_with(&map).unwrap();
+        assert_eq!(cfg.custom_prompt, None);
+    }
+
+    #[test]
+    fn parse_vision_config_max_tokens_validation() {
+        let url = ("VISION_URL", "http://vision/v1/chat/completions");
+        let key = ("VISION_API_KEY", "k");
+        let model = ("VISION_MODEL", "m");
+
+        for (raw, expected) in [
+            ("abc", None),
+            ("0", None),
+            ("", None),
+            ("-1", None),
+            ("1024", Some(1024)),
+        ] {
+            let mut map = env_map(&[url, key, model]);
+            if !raw.is_empty() {
+                map.insert("VISION_MAX_TOKENS".into(), raw.into());
+            }
+            let cfg = parse_with(&map).unwrap();
+            assert_eq!(cfg.max_tokens, expected, "VISION_MAX_TOKENS={raw:?}");
+        }
+    }
+
+    #[test]
+    fn parse_vision_config_missing_required_returns_none() {
+        // Missing VISION_API_KEY → whole vision config disabled (additive gate).
+        let map = env_map(&[("VISION_URL", "http://vision/v1/chat/completions"), ("VISION_MODEL", "m")]);
+        assert!(parse_vision_config_with(|name| map.get(name).cloned()).unwrap().is_none());
     }
 }
