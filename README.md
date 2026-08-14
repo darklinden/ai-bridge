@@ -177,10 +177,12 @@ Add tests alongside conversion changes — especially `streaming_responses`, whi
 
 ## Acknowledgments
 
-`ai-bridge` builds on ideas from two neighboring projects in this workspace, and we're grateful to both communities:
+`ai-bridge` builds on ideas from three neighboring projects in this workspace, and we're grateful to all three communities:
 
 - **[CLI Proxy API] <https://github.com/router-for-me/CLIProxyAPI>** — a proxy server that exposes OpenAI/Gemini/Claude/Codex/Grok-compatible API endpoints for CLIs, letting any OpenAI- or Claude-compatible client reach multiple providers and accounts. Its approach of surfacing multiple upstream providers behind a single compatible local surface was a key inspiration for `ai-bridge`'s "many local entries, one upstream" design.
 
 - **[CC Switch] <https://github.com/farion1231/cc-switch>** — the all-in-one manager for Claude Code, Claude Desktop, Codex, Gemini CLI, and other agentic tools, including a built-in local proxy. `ai-bridge`'s `UPSTREAM_HEADERS` parsing (pipe-separated `A:a|B:b` overrides) directly mirrors cc-switch's `apply_local_proxy_header_overrides` implementation, and its header-override semantics follow the same conventions.
 
-Thank you to the maintainers and contributors of both projects for their work and for making the source available.
+- **[Plugin-Deepseek-Vision] <https://github.com/Zesuy/Plugin-Deepseek-Vision>** — a CLIProxyAPI v7 plugin (Go, MIT) that gives DeepSeek's text-only models the ability to understand images: it intercepts incoming requests after routing, has the host's vision models analyze the images (grouping multiple images per prompt into one joint VLM call), and rewrites the image blocks into a joint text analysis before DeepSeek ever sees the prompt. That is the same "describe images with a vision model when the target model is text-only" strategy behind `ai-bridge`'s vision preprocessing (ADR-0004), and its fail-closed philosophy — on any vision failure the plugin refuses to forward raw images rather than silently degrade — mirrored `ai-bridge`'s decision to drop to `[Unsupported Image]` and never let a vision failure block a request.
+
+Thank you to the maintainers and contributors of all three projects for their work and for making the source available.
