@@ -4,6 +4,7 @@ mod error;
 mod forward;
 mod json_canonical;
 mod media_sanitizer;
+mod passthrough_log;
 mod reasoning_bridge;
 mod reqlog;
 mod responses_reverse;
@@ -15,7 +16,6 @@ mod vision;
 
 use crate::error::Error;
 use crate::forward::AppState;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -71,17 +71,22 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-/// Load `.env` into the process environment, preferring the Cargo manifest
-/// directory (dev: `cargo run`) and falling back to the executable's directory
-/// (deploy). Uses `from_path` (no override) so an already-exported env var wins.
-/// Missing `.env` is silently ignored.
+/// Load `.env` into the process environment, preferring the executable's
+/// directory (deploy). In dev builds (`cargo run`, `debug_assertions` on) it
+/// additionally falls back to the Cargo manifest directory, since the binary
+/// lives under target/ where no `.env` normally sits. In release builds the
+/// manifest path is not consulted at all, so a deployed binary never leaks a
+/// dev-machine path. Uses `from_path` (no override) so an already-exported env
+/// var wins. Missing `.env` is silently ignored.
 fn load_dotenv() {
-    let mut candidates = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env")];
+    let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join(".env"));
         }
     }
+    #[cfg(debug_assertions)]
+    candidates.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env"));
     for path in candidates {
         if path.is_file() {
             match dotenvy::from_path(&path) {

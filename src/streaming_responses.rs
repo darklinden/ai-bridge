@@ -796,7 +796,6 @@ mod tests {
     use serde_json::{json, Value};
     use std::convert::Infallible;
     use std::io::Error as IoError;
-    use std::io::ErrorKind;
 
     /// Build a complete SSE block with a named event and JSON data. The block
     /// must be `\n\n`-terminated since `take_sse_block` frames on the delimiter.
@@ -1189,7 +1188,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_error_yields_stream_error() {
-        let events = run_results(vec![Err(IoError::new(ErrorKind::Other, "boom"))]).await;
+        let events = run_results(vec![Err(IoError::other("boom"))]).await;
 
         let names = event_names(&events);
         assert_eq!(names, vec!["error"]);

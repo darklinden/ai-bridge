@@ -331,10 +331,17 @@ fn build_responses_usage(usage: Option<&Value>) -> Value {
 }
 
 /// Convert an Anthropic Messages SSE stream to an OpenAI Responses SSE stream.
+///
+/// `log_resp` controls streaming response logging: `true` means this stream is
+/// the sole logger for the request and should `reqlog.append` the text/tool
+/// deltas it emits; `false` means it is the OUTER wrapper of a double-bridge
+/// chain whose inner stream already logs, so only the (idempotent) header/done
+/// fire and no content is appended.
 pub fn anthropic_to_responses_sse<S, E>(
     stream: S,
     model: String,
     reqlog: Arc<crate::reqlog::ReqLog>,
+    log_resp: bool,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -344,6 +351,7 @@ where
 
     stream! {
         reqlog.resp_header("");
+        let mut resp_has_text = false;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let current_model = model;
@@ -415,6 +423,9 @@ where
                                             tool_item_count += 1;
                                             let id = b.get("id").and_then(Value::as_str).unwrap_or("");
                                             let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                                            if log_resp && !resp_has_text {
+                                                reqlog.append(&format!("[tool_use: {name}]"));
+                                            }
                                             let item = json!({
                                                 "type": "response.output_item.added",
                                                 "output_index": tool_item_count,
@@ -438,6 +449,10 @@ where
                                     match d.get("type").and_then(Value::as_str) {
                                         Some("text_delta") => {
                                             let text = d.get("text").and_then(Value::as_str).unwrap_or("");
+                                            if log_resp {
+                                                resp_has_text = true;
+                                                reqlog.append(text);
+                                            }
                                             let delta = json!({
                                                 "type": "response.output_text.delta",
                                                 "item_id": format!("msg_{}", content_index),
@@ -495,35 +510,38 @@ where
                                 });
                                 yield Ok(Bytes::from(sse_block("response.output_item.done", &done_ev)));
                             }
-                            "message_stop" => {
-                                if !done {
-                                    done = true;
-                                    let completed = json!({
-                                        "type": "response.completed",
-                                        "response": {
-                                            "id": response_id,
-                                            "object": "response",
-                                            "created_at": 0,
-                                            "status": "completed",
-                                            "model": current_model,
-                                            "output": [],
-                                            "usage": {
-                                                "input_tokens": 0,
-                                                "output_tokens": 0,
-                                                "total_tokens": 0
-                                            }
+                            "message_stop" if !done => {
+                                done = true;
+                                let completed = json!({
+                                    "type": "response.completed",
+                                    "response": {
+                                        "id": response_id,
+                                        "object": "response",
+                                        "created_at": 0,
+                                        "status": "completed",
+                                        "model": current_model,
+                                        "output": [],
+                                        "usage": {
+                                            "input_tokens": 0,
+                                            "output_tokens": 0,
+                                            "total_tokens": 0
                                         }
-                                    });
-                                    yield Ok(Bytes::from(sse_block("response.completed", &completed)));
-                                    yield Ok(Bytes::from("data: [DONE]\n\n".to_string()));
-                                }
+                                    }
+                                });
+                                yield Ok(Bytes::from(sse_block("response.completed", &completed)));
+                                yield Ok(Bytes::from("data: [DONE]\n\n".to_string()));
                             }
                             _ => {}
                             }
                         }
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    if log_resp {
+                        reqlog.err_resp(&format!("Stream error: {e}"));
+                    }
+                    break;
+                }
             }
         }
         reqlog.done();
@@ -541,6 +559,42 @@ fn sse_block(event: &str, value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reqlog::ReqLog;
+    use std::convert::Infallible;
+
+    /// Drive `anthropic_to_responses_sse` with canned Anthropic SSE frames and
+    /// collect the emitted `(event, data)` pairs (the `data: [DONE]` terminator
+    /// is dropped).
+    async fn run_responses_sse(frames: Vec<String>, log_resp: bool) -> Vec<(String, Value)> {
+        let upstream = futures::stream::iter(
+            frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
+        let out =
+            anthropic_to_responses_sse(upstream, "gpt-5".to_string(), ReqLog::new(), log_resp);
+        let chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let mut text = String::new();
+        for c in &chunks {
+            text.push_str(&String::from_utf8_lossy(c));
+        }
+        text.split("\n\n")
+            .filter(|b| !b.trim().is_empty())
+            .filter_map(|block| {
+                let mut ev = String::new();
+                let mut data = String::new();
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("event: ") {
+                        ev = v.to_string();
+                    } else if let Some(v) = line.strip_prefix("data: ") {
+                        data = v.to_string();
+                    }
+                }
+                if data.trim() == "[DONE]" {
+                    return None;
+                }
+                Some((ev, serde_json::from_str(&data).unwrap_or(Value::Null)))
+            })
+            .collect()
+    }
 
     #[test]
     fn responses_to_anthropic_request_maps_instructions_and_input() {
@@ -628,5 +682,73 @@ mod tests {
         });
         let result = anthropic_to_responses_response(&body, "gpt-5").unwrap();
         assert_eq!(result["status"], "completed");
+    }
+
+    // -----------------------------------------------------------------------
+    // anthropic_to_responses_sse output regression (append-logging must not alter bytes)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn responses_sse_logging_flag_does_not_alter_output() {
+        let frames = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Mock \"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"anthropic\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n".to_string(),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ];
+        let with_log = run_responses_sse(frames.clone(), true).await;
+        let without_log = run_responses_sse(frames, false).await;
+        // The log_resp flag must not change the emitted SSE events.
+        assert_eq!(with_log, without_log);
+
+        let ev_names: Vec<&str> = with_log.iter().map(|(e, _)| e.as_str()).collect();
+        assert_eq!(
+            ev_names,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let deltas: Vec<&str> = with_log
+            .iter()
+            .filter(|(e, _)| e == "response.output_text.delta")
+            .map(|(_, v)| v.get("delta").and_then(Value::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(deltas, vec!["Mock ", "anthropic"]);
+    }
+
+    #[tokio::test]
+    async fn responses_sse_maps_tool_use_and_arguments() {
+        let frames = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"get_weather\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"tokyo\\\"}\"}}\n\n".to_string(),
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n".to_string(),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ];
+        let out = run_responses_sse(frames, true).await;
+
+        let fc = out
+            .iter()
+            .find(|(e, v)| e == "response.output_item.added" && v["item"]["type"] == "function_call")
+            .map(|(_, v)| v.clone())
+            .expect("function_call item emitted");
+        assert_eq!(fc["item"]["name"], "get_weather");
+
+        let arg_deltas: Vec<&str> = out
+            .iter()
+            .filter(|(e, _)| e == "response.function_call_arguments.delta")
+            .filter_map(|(_, v)| v.get("delta").and_then(Value::as_str))
+            .collect();
+        assert_eq!(arg_deltas, vec!["{\"city\":\"tokyo\"}"]);
     }
 }

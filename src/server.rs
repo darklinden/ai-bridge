@@ -478,6 +478,13 @@ async fn handle_passthrough(
             return Ok(upstream_error_response(status, body, entry));
         }
         let stream = upstream_resp.bytes_stream();
+        // Log the streamed response text onto the `[RESP]` line while forwarding
+        // the bytes verbatim (the local entry and upstream share a wire format).
+        let stream = crate::passthrough_log::log_stream(
+            crate::passthrough_log::StreamFormat::from_local_entry(entry),
+            stream,
+            reqlog.clone(),
+        );
         Ok(sse_response(Body::from_stream(stream)))
     } else {
         let upstream_resp = match crate::forward::forward_to_zen(
@@ -673,6 +680,7 @@ async fn handle_chat_entry_to_anthropic(
             stream,
             model.to_string(),
             reqlog.clone(),
+            true, // standalone: this stream is the sole response-text logger
         );
         Ok(sse_response(Body::from_stream(chat_stream)))
     } else {
@@ -749,6 +757,7 @@ async fn handle_chat_entry_to_responses(
             anthropic_stream,
             model.to_string(),
             reqlog.clone(),
+            false, // outer wrapper: inner responses_to_anthropic_sse already logs
         );
         Ok(sse_response(Body::from_stream(chat_stream)))
     } else {
@@ -826,6 +835,7 @@ async fn handle_responses_entry_to_anthropic(
             stream,
             model.to_string(),
             reqlog.clone(),
+            true, // standalone: this stream is the sole response-text logger
         );
         Ok(sse_response(Body::from_stream(responses_stream)))
     } else {
@@ -903,6 +913,7 @@ async fn handle_responses_entry_to_chat(
             anthropic_stream,
             model.to_string(),
             reqlog.clone(),
+            false, // outer wrapper: inner chat_to_anthropic_sse already logs
         );
         Ok(sse_response(Body::from_stream(responses_stream)))
     } else {

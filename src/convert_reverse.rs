@@ -148,9 +148,8 @@ pub fn chat_to_anthropic_request(body: &Value) -> Result<Value, Error> {
         .and_then(Value::as_bool)
         == Some(false);
     if let Some(tc) = body.get("tool_choice") {
-        let mapped = map_chat_tool_choice(tc);
-        if mapped.is_some() {
-            result["tool_choice"] = mapped.unwrap();
+        if let Some(mapped) = map_chat_tool_choice(tc) {
+            result["tool_choice"] = mapped;
         }
     }
     if disable_parallel {
@@ -495,8 +494,8 @@ pub fn anthropic_to_chat_response(body: &Value, model: &str) -> Result<Value, Er
         "role": "assistant",
         "content": if content_parts.is_empty() { Value::String(String::new()) } else { Value::Array(content_parts) }
     });
-    if reasoning_content.is_some() {
-        assistant["reasoning_content"] = json!(reasoning_content.unwrap());
+    if let Some(rc) = reasoning_content {
+        assistant["reasoning_content"] = json!(rc);
     }
     if !tool_calls.is_empty() {
         assistant["tool_calls"] = json!(tool_calls);
@@ -549,10 +548,17 @@ fn map_stop_reason_to_finish(stop: Option<&str>) -> Option<String> {
 /// Convert an Anthropic Messages SSE stream to an OpenAI Chat Completions SSE
 /// stream. Mirrors `convert::chat_to_anthropic_sse` in reverse: emits
 /// `chat.completion.chunk` events for each delta.
+///
+/// `log_resp` controls streaming response logging: `true` means this stream is
+/// the sole logger for the request and should `reqlog.append` the text/reasoning
+/// deltas it emits; `false` means it is the OUTER wrapper of a double-bridge
+/// chain whose inner stream already logs, so only the (idempotent) header/done
+/// fire and no content is appended.
 pub fn anthropic_to_chat_sse<S, E>(
     stream: S,
     model: String,
     reqlog: Arc<crate::reqlog::ReqLog>,
+    log_resp: bool,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -562,6 +568,7 @@ where
 
     stream! {
         reqlog.resp_header("");
+        let mut resp_has_text = false;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut chunk_id = 0u32;
@@ -620,6 +627,9 @@ where
                                         Some("tool_use") => {
                                             let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
                                             let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                                            if log_resp && !resp_has_text {
+                                                reqlog.append(&format!("[tool_use: {name}]"));
+                                            }
                                             tool_index = idx;
                                             let chunk = json!({
                                                 "id": format!("chatcmpl-{}", chunk_id),
@@ -652,6 +662,10 @@ where
                                     match d.get("type").and_then(Value::as_str) {
                                         Some("text_delta") => {
                                             let text = d.get("text").and_then(Value::as_str).unwrap_or("");
+                                            if log_resp {
+                                                resp_has_text = true;
+                                                reqlog.append(text);
+                                            }
                                             let chunk = json!({
                                                 "id": format!("chatcmpl-{}", chunk_id),
                                                 "object": "chat.completion.chunk",
@@ -667,6 +681,9 @@ where
                                         }
                                         Some("thinking_delta") => {
                                             let thinking = d.get("thinking").and_then(Value::as_str).unwrap_or("");
+                                            if log_resp {
+                                                reqlog.append(thinking);
+                                            }
                                             let chunk = json!({
                                                 "id": format!("chatcmpl-{}", chunk_id),
                                                 "object": "chat.completion.chunk",
@@ -744,8 +761,11 @@ where
                         }
                     }
                 }
-                Err(_) => {
+                Err(e) => {
                     // terminate stream on upstream error
+                    if log_resp {
+                        reqlog.err_resp(&format!("Stream error: {e}"));
+                    }
                     break;
                 }
             }
@@ -765,6 +785,27 @@ fn sse_chunk(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reqlog::ReqLog;
+    use std::convert::Infallible;
+
+    /// Drive `anthropic_to_chat_sse` with canned Anthropic SSE frames and
+    /// collect the emitted `data:` JSON values (the `[DONE]` sentinel is dropped).
+    async fn run_chat_sse(frames: Vec<String>, log_resp: bool) -> Vec<Value> {
+        let upstream =
+            futures::stream::iter(frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))));
+        let out = anthropic_to_chat_sse(upstream, "gpt-5".to_string(), ReqLog::new(), log_resp);
+        let chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let mut text = String::new();
+        for c in &chunks {
+            text.push_str(&String::from_utf8_lossy(c));
+        }
+        text.split("\n\n")
+            .filter_map(|block| {
+                let data = block.lines().find_map(|l| l.strip_prefix("data: "))?;
+                serde_json::from_str(data.trim()).ok()
+            })
+            .collect()
+    }
 
     #[test]
     fn chat_to_anthropic_request_maps_system_and_tools() {
@@ -910,5 +951,89 @@ mod tests {
         let result = anthropic_to_chat_response(&body, "gpt-5").unwrap();
         assert_eq!(result["choices"][0]["message"]["reasoning_content"], "let me think");
         assert_eq!(result["choices"][0]["message"]["content"][0]["text"], "answer");
+    }
+
+    // -----------------------------------------------------------------------
+    // anthropic_to_chat_sse output regression (append-logging must not alter bytes)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chat_sse_logging_flag_does_not_alter_output() {
+        let frames = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Mock \"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"anthropic\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n".to_string(),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ];
+        let with_log = run_chat_sse(frames.clone(), true).await;
+        let without_log = run_chat_sse(frames, false).await;
+        // The log_resp flag must not change the emitted SSE events.
+        assert_eq!(with_log, without_log);
+
+        let contents: Vec<&str> = with_log
+            .iter()
+            .filter_map(|v| v.pointer("/choices/0/delta/content").and_then(Value::as_str))
+            .collect();
+        assert_eq!(contents, vec!["Mock ", "anthropic"]);
+
+        let finishes: Vec<&str> = with_log
+            .iter()
+            .filter_map(|v| v.pointer("/choices/0/finish_reason").and_then(Value::as_str))
+            .collect();
+        assert_eq!(finishes, vec!["stop"]);
+    }
+
+    #[tokio::test]
+    async fn chat_sse_maps_thinking_delta_to_reasoning_content() {
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reasoning here\"}}\n\n".to_string(),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ];
+        let out = run_chat_sse(frames, true).await;
+        // The thinking content_block_start emits an empty reasoning_content chunk;
+        // only the thinking_delta should carry the real text.
+        let reasoning: Vec<&str> = out
+            .iter()
+            .filter_map(|v| v.pointer("/choices/0/delta/reasoning_content").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(reasoning, vec!["reasoning here"]);
+    }
+
+    #[tokio::test]
+    async fn chat_sse_maps_tool_use_and_arguments() {
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"get_weather\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"tokyo\\\"}\"}}\n\n".to_string(),
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n".to_string(),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ];
+        let out = run_chat_sse(frames, true).await;
+
+        let names: Vec<&str> = out
+            .iter()
+            .filter_map(|v| v.pointer("/choices/0/delta/tool_calls/0/function/name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["get_weather"]);
+
+        let args: Vec<&str> = out
+            .iter()
+            .filter_map(|v| {
+                v.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                    .and_then(Value::as_str)
+            })
+            .filter(|s| !s.is_empty()) // tool_use start emits an empty arguments chunk
+            .collect();
+        assert_eq!(args, vec!["{\"city\":\"tokyo\"}"]);
+
+        let finishes: Vec<&str> = out
+            .iter()
+            .filter_map(|v| v.pointer("/choices/0/finish_reason").and_then(Value::as_str))
+            .collect();
+        assert_eq!(finishes, vec!["tool_calls"]);
     }
 }
