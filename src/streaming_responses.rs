@@ -181,7 +181,8 @@ where
                             if let Ok(json_data) = serde_json::from_str::<Value>(&data) {
                                 if message_id.is_empty() {
                                     message_id = json_data
-                                        .get("id")
+                                        .pointer("/response/id")
+                                        .or_else(|| json_data.get("id")) // 旧拍平
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
@@ -216,11 +217,13 @@ where
                         if event_type == "response.content_part.added" {
                             if let Ok(json_data) = serde_json::from_str::<Value>(&data) {
                                 let part_type = json_data
-                                    .get("type")
+                                    .pointer("/part/type") // 真实：part.type
+                                    .or_else(|| json_data.get("type")) // 旧拍平
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
                                 let part_index = json_data
-                                    .get("part_index")
+                                    .get("content_index") // 真实字段
+                                    .or_else(|| json_data.get("part_index")) // 旧拍平
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0) as u32;
                                 let item_id = json_data
@@ -282,7 +285,8 @@ where
                             if let Ok(json_data) = serde_json::from_str::<Value>(&data) {
                                 if let Some(delta) = json_data.get("delta").and_then(|v| v.as_str()) {
                                     let part_index = json_data
-                                        .get("part_index")
+                                        .get("content_index") // 真实字段
+                                        .or_else(|| json_data.get("part_index")) // 旧拍平
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0) as u32;
                                     let item_id = json_data
@@ -305,6 +309,44 @@ where
                                             serde_json::to_string(&event).unwrap_or_default()
                                         );
                                         resp_has_text = true;
+                                        reqlog.append(delta);
+                                        yield Ok(Bytes::from(sse_data));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // ==========================================================
+                        // response.reasoning_summary_text.delta
+                        // ==========================================================
+                        // 真实格式的推理摘要文本走独立 delta 事件，按 item_id 查块索引，
+                        // 累加进 reasoning_text_by_index 并产出 thinking_delta 转发。
+                        // 旧式拍平格式不发此事件，不受影响。
+                        if event_type == "response.reasoning_summary_text.delta" {
+                            if let Ok(json_data) = serde_json::from_str::<Value>(&data) {
+                                if let Some(delta) = json_data.get("delta").and_then(Value::as_str) {
+                                    let item_id = json_data
+                                        .get("item_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    if let Some(&index) = reasoning_index_by_item_id.get(item_id) {
+                                        reasoning_text_by_index
+                                            .entry(index)
+                                            .or_default()
+                                            .push_str(delta);
+                                        let event = json!({
+                                            "type": "content_block_delta",
+                                            "index": index,
+                                            "delta": {
+                                                "type": "thinking_delta",
+                                                "thinking": delta
+                                            }
+                                        });
+                                        let sse_data = format!(
+                                            "event: content_block_delta\ndata: {}\n\n",
+                                            serde_json::to_string(&event).unwrap_or_default()
+                                        );
                                         reqlog.append(delta);
                                         yield Ok(Bytes::from(sse_data));
                                     }
@@ -337,26 +379,28 @@ where
                         // ==========================================================
                         if event_type == "response.output_item.added" {
                             if let Ok(json_data) = serde_json::from_str::<Value>(&data) {
-                                let item_type = json_data
-                                    .get("type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let item_id = json_data
+                                // 真实格式 item 字段嵌套在 `item` 对象里；旧拍平格式字段全在顶层
+                                let item = json_data
+                                    .get("item")
+                                    .cloned()
+                                    .unwrap_or_else(|| json_data.clone());
+                                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                                let item_id = item
                                     .get("id")
-                                    .and_then(|v| v.as_str())
+                                    .and_then(Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
 
                                 match item_type {
                                     "function_call" => {
-                                        let call_id = json_data
+                                        let call_id = item
                                             .get("call_id")
-                                            .and_then(|v| v.as_str())
+                                            .and_then(Value::as_str)
                                             .unwrap_or("")
                                             .to_string();
-                                        let name = json_data
+                                        let name = item
                                             .get("name")
-                                            .and_then(|v| v.as_str())
+                                            .and_then(Value::as_str)
                                             .unwrap_or("")
                                             .to_string();
 
@@ -386,7 +430,7 @@ where
                                         yield Ok(Bytes::from(sse_data));
                                     }
                                     "reasoning" => {
-                                        let summary_text = json_data
+                                        let summary_text = item
                                             .get("summary")
                                             .and_then(|v| v.as_array())
                                             .into_iter()
@@ -400,7 +444,9 @@ where
                                         let index = next_content_index;
                                         next_content_index += 1;
                                         reasoning_index_by_item_id.insert(item_id, index);
-                                        reasoning_item_by_index.insert(index, json_data.clone());
+                                        // 存 item 本体：真实格式下 encode_openai_reasoning_item
+                                        // 需看到 `type:"reasoning"` 的 item；拍平格式下退化为原对象，行为不变
+                                        reasoning_item_by_index.insert(index, item.clone());
                                         reasoning_text_by_index.insert(index, summary_text.clone());
 
                                         let event = json!({
@@ -489,14 +535,13 @@ where
                         // ==========================================================
                         if event_type == "response.output_item.done" {
                             if let Ok(json_data) = serde_json::from_str::<Value>(&data) {
-                                let item_type = json_data
-                                    .get("type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let item_id = json_data
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                // 真实格式 item 字段嵌套在 `item` 对象里；旧拍平格式字段全在顶层
+                                let item = json_data
+                                    .get("item")
+                                    .cloned()
+                                    .unwrap_or_else(|| json_data.clone());
+                                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                                let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
 
                                 match item_type {
                                     "function_call" => {
@@ -590,7 +635,9 @@ where
 
                                 // Build usage
                                 let usage = build_anthropic_usage_from_responses_streaming(
-                                    json_data.get("usage")
+                                    json_data
+                                        .pointer("/response/usage") // 真实：response.usage
+                                        .or_else(|| json_data.get("usage")) // 旧拍平
                                 );
 
                                 let stop_reason = if event_type == "response.incomplete" {
@@ -612,7 +659,8 @@ where
                             let error_msg = serde_json::from_str::<Value>(&data)
                                 .ok()
                                 .and_then(|v| {
-                                    v.pointer("/error/message")
+                                    v.pointer("/response/error/message") // 真实：response.error.message
+                                        .or_else(|| v.pointer("/error/message"))
                                         .or_else(|| v.get("message"))
                                         .and_then(|m| m.as_str())
                                         .map(|s| s.to_string())
@@ -1231,6 +1279,202 @@ mod tests {
             names,
             vec!["message_start", "content_block_start", "content_block_stop", "message_delta", "message_stop"]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Real OpenAI Responses nested-format tests
+    // -----------------------------------------------------------------------
+    // 真实 OpenAI Responses 流式事件顶层 `type` 是事件名，item/part/usage/error
+    // 字段嵌套在 `item`/`part`/`response` 对象里。这些用例锁定双格式兼容回退修复。
+
+    #[tokio::test]
+    async fn nested_format_text_full_cycle() {
+        let events = run(vec![
+            sse_block(
+                "response.created",
+                &json!({"type": "response.created", "response": {"id": "resp_1", "object": "response", "status": "in_progress"}}),
+            ),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "response.output_item.added", "sequence_number": 0, "item": {"id": "msg_0", "type": "message", "role": "assistant", "content": []}}),
+            ),
+            sse_block(
+                "response.content_part.added",
+                &json!({"type": "response.content_part.added", "sequence_number": 1, "item_id": "msg_0", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}),
+            ),
+            sse_block(
+                "response.output_text.delta",
+                &json!({"type": "response.output_text.delta", "sequence_number": 2, "item_id": "msg_0", "output_index": 0, "content_index": 0, "delta": "Hello"}),
+            ),
+            sse_block(
+                "response.output_text.delta",
+                &json!({"type": "response.output_text.delta", "sequence_number": 3, "item_id": "msg_0", "output_index": 0, "content_index": 0, "delta": ", world"}),
+            ),
+            sse_block(
+                "response.output_text.done",
+                &json!({"type": "response.output_text.done", "sequence_number": 4, "item_id": "msg_0", "output_index": 0, "content_index": 0, "text": "Hello, world"}),
+            ),
+            sse_block(
+                "response.content_part.done",
+                &json!({"type": "response.content_part.done", "sequence_number": 5, "item_id": "msg_0", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "Hello, world", "annotations": []}}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "response.output_item.done", "sequence_number": 6, "output_index": 0, "item": {"id": "msg_0", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hello, world", "annotations": []}]}}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "object": "response", "status": "completed", "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}}),
+            ),
+        ])
+        .await;
+
+        // 事件序列与现有拍平测试 simple_text_stream_full_cycle 一致，且两个
+        // text delta 都转发（真实格式下文本不再被丢弃）。
+        let names = event_names(&events);
+        let expect: Vec<&str> = vec![
+            "message_start",
+            "content_block_start", // index 0
+            "content_block_delta", // "Hello"
+            "content_block_delta", // ", world"
+            "content_block_stop",  // index 0
+            "message_delta",
+            "message_stop",
+        ];
+        assert_eq!(names, expect);
+
+        assert_eq!(events[0].1["message"]["id"], "resp_1"); // 来自 /response/id
+        assert_eq!(events[1].1["index"], 0);
+        assert_eq!(events[1].1["content_block"]["type"], "text");
+        assert_eq!(events[2].1["delta"], json!({"type": "text_delta", "text": "Hello"}));
+        assert_eq!(events[3].1["delta"], json!({"type": "text_delta", "text": ", world"}));
+        assert_eq!(events[4].1["index"], 0);
+        // usage 来自 /response/usage
+        assert_eq!(events[5].1["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+        assert!(events[5].1["delta"]["stop_reason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn nested_format_function_call() {
+        let events = run(vec![
+            sse_block(
+                "response.created",
+                &json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            ),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "response.output_item.added", "sequence_number": 0, "item": {"id": "fc_1", "type": "function_call", "status": "in_progress", "call_id": "call_1", "name": "get_weather", "arguments": ""}}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 0, "delta": "{\"city\":\""}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "response.output_item.done", "sequence_number": 1, "output_index": 0, "item": {"id": "fc_1", "type": "function_call", "status": "completed", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+
+        // call_id/name 从 item 对象读取 -> tool_use 块正常开启
+        let names = event_names(&events);
+        let expect: Vec<&str> = vec![
+            "message_start",
+            "content_block_start", // tool_use
+            "content_block_delta", // input_json_delta
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ];
+        assert_eq!(names, expect);
+
+        assert_eq!(
+            events[1].1["content_block"],
+            json!({"type": "tool_use", "id": "call_1", "name": "get_weather"})
+        );
+        assert_eq!(events[1].1["index"], 0);
+        assert_eq!(events[2].1["delta"]["type"], "input_json_delta");
+        assert_eq!(events[2].1["delta"]["partial_json"], "{\"city\":\"");
+        assert_eq!(events[3].1["index"], 0);
+    }
+
+    #[tokio::test]
+    async fn nested_format_reasoning_with_summary_delta() {
+        let events = run(vec![
+            sse_block(
+                "response.created",
+                &json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            ),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "response.output_item.added", "sequence_number": 0, "item": {"id": "rs_1", "type": "reasoning", "status": "in_progress", "summary": []}}),
+            ),
+            sse_block(
+                "response.reasoning_summary_text.delta",
+                &json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "output_index": 0, "delta": "Let me think"}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "response.output_item.done", "sequence_number": 1, "output_index": 0, "item": {"id": "rs_1", "type": "reasoning", "status": "completed", "summary": [{"type": "summary_text", "text": "Let me think"}]}}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+
+        let names = event_names(&events);
+        let expect: Vec<&str> = vec![
+            "message_start",
+            "content_block_start", // thinking
+            "content_block_delta", // thinking_delta（来自 reasoning_summary_text.delta）
+            "content_block_delta", // signature_delta
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ];
+        assert_eq!(names, expect);
+
+        assert_eq!(
+            events[1].1["content_block"],
+            json!({"type": "thinking", "thinking": ""})
+        );
+        assert_eq!(events[2].1["delta"]["type"], "thinking_delta");
+        assert_eq!(events[2].1["delta"]["thinking"], "Let me think");
+
+        // signature 由 item 本体编码，能 decode 出 type:"reasoning"
+        assert_eq!(events[3].1["delta"]["type"], "signature_delta");
+        let sig = events[3].1["delta"]["signature"].as_str().unwrap();
+        let decoded = crate::reasoning_bridge::decode_openai_reasoning_item(sig).unwrap();
+        assert_eq!(decoded["type"], "reasoning");
+        assert_eq!(decoded["id"], "rs_1");
+        assert_eq!(events[4].1["index"], 0);
+    }
+
+    #[tokio::test]
+    async fn nested_format_failed_error_message() {
+        let events = run(vec![
+            sse_block(
+                "response.created",
+                &json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            ),
+            sse_block(
+                "response.failed",
+                &json!({"type": "response.failed", "response": {"id": "resp_1", "status": "failed", "error": {"code": "server_error", "message": "boom"}}}),
+            ),
+        ])
+        .await;
+
+        // error message 来自 /response/error/message
+        let names = event_names(&events);
+        assert_eq!(names, vec!["message_start", "error"]);
+        assert_eq!(events[1].1["error"]["type"], "api_error");
+        assert_eq!(events[1].1["error"]["message"], "boom");
     }
 
     // -----------------------------------------------------------------------
