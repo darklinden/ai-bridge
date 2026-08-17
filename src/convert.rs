@@ -13,7 +13,8 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -23,6 +24,10 @@ const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
 
 /// Infinite-whitespace bug threshold (Copilot tool call arguments).
 const INFINITE_WHITESPACE_THRESHOLD: usize = 500;
+
+/// 已打过 warn 的未知 finish_reason 值集合，用于「未知值只 warn 一次、
+/// 之后降级为 debug」，避免噪声上游逐 chunk 刷屏。
+static WARNED_UNKNOWN_FINISH_REASONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Model detection helpers
@@ -778,16 +783,7 @@ pub fn openai_to_anthropic(body: Value, model: &str) -> Result<Value, Error> {
     let stop_reason = choice
         .get("finish_reason")
         .and_then(|r| r.as_str())
-        .map(|r| match r {
-            "stop" => "end_turn",
-            "length" => "max_tokens",
-            "tool_calls" | "function_call" => "tool_use",
-            "content_filter" => "end_turn",
-            other => {
-                tracing::warn!("Unknown finish_reason in non-streaming: {other}");
-                "end_turn"
-            }
-        })
+        .map(|r| map_finish_reason_to_stop(r, "non-streaming"))
         .or(if has_tool_use { Some("tool_use") } else { None });
 
     // Usage mapping
@@ -1630,20 +1626,53 @@ fn extract_cache_write_tokens(usage: &Usage) -> Option<u32> {
         .filter(|value| *value > 0)
 }
 
-fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
-    finish_reason.map(|r| {
-        match r {
-            "tool_calls" | "function_call" => "tool_use",
-            "stop" => "end_turn",
-            "length" => "max_tokens",
-            "content_filter" => "end_turn",
-            other => {
-                tracing::warn!("Unknown finish_reason in streaming: {other}");
-                "end_turn"
-            }
+/// Map an OpenAI / OpenAI-compatible `finish_reason` to an Anthropic
+/// `stop_reason`. `ctx` labels the caller ("streaming" / "non-streaming")
+/// for log messages.
+///
+/// Standard OpenAI values map to their Anthropic equivalents. `refusal` (also
+/// emitted by newer OpenAI-compatible servers) maps to Anthropic's own
+/// `refusal`, preserving the semantics instead of faking a normal end.
+/// Third-party variants that still mean "finished" fall back to `end_turn` at
+/// debug level; only the first occurrence of a genuinely unknown value is
+/// warned, so a noisy upstream can't flood the log.
+fn map_finish_reason_to_stop(reason: &str, ctx: &str) -> &'static str {
+    match reason {
+        // Standard OpenAI finish reasons.
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" | "function_call" => "tool_use",
+        "content_filter" => "end_turn",
+        // Model refused to answer — Anthropic has an equivalent stop_reason.
+        "refusal" => "refusal",
+        // DeepSeek's documented extra value: server resource limit. No
+        // Anthropic equivalent; treat as a (possibly truncated) end.
+        "insufficient_system_resource" => {
+            tracing::debug!(
+                "finish_reason 'insufficient_system_resource' in {ctx}, treating as end_turn"
+            );
+            "end_turn"
         }
-        .to_string()
-    })
+        // Anything else: warn once per distinct value, then downgrade to debug.
+        other => {
+            let mut seen = WARNED_UNKNOWN_FINISH_REASONS
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap();
+            if seen.insert(other.to_string()) {
+                tracing::warn!(
+                    "Unknown finish_reason ({other}) in {ctx}, treating as end_turn; further occurrences logged at debug"
+                );
+            } else {
+                tracing::debug!("Unknown finish_reason ({other}) in {ctx}, treating as end_turn");
+            }
+            "end_turn"
+        }
+    }
+}
+
+fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
+    finish_reason.map(|r| map_finish_reason_to_stop(r, "streaming").to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,6 +1799,51 @@ mod tests {
 
     fn event_names(events: &[(String, Value)]) -> Vec<&str> {
         events.iter().map(|(e, _)| e.as_str()).collect()
+    }
+
+    #[test]
+    fn openai_refusal_finish_maps_to_refusal_stop() {
+        let body = json!({
+            "id": "x",
+            "choices": [{
+                "message": { "role": "assistant", "content": "" },
+                "finish_reason": "refusal"
+            }]
+        });
+        let out = openai_to_anthropic(body, "model").unwrap();
+        assert_eq!(out["stop_reason"], "refusal");
+    }
+
+    #[test]
+    fn openai_nonstandard_finish_maps_to_end_turn() {
+        let body = json!({
+            "id": "x",
+            "choices": [{
+                "message": { "role": "assistant", "content": "partial" },
+                "finish_reason": "insufficient_system_resource"
+            }]
+        });
+        let out = openai_to_anthropic(body.clone(), "model").unwrap();
+        assert_eq!(out["stop_reason"], "end_turn");
+        // 第二次调用同样走 once-warn 去重路径，不应 panic。
+        let again = openai_to_anthropic(body, "model").unwrap();
+        assert_eq!(again["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn refusal_finish_propagates_to_message_delta() {
+        let events = run(vec![
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"No\"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"refusal\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        let delta = events
+            .iter()
+            .find(|(e, _)| e == "message_delta")
+            .unwrap();
+        assert_eq!(delta.1["delta"]["stop_reason"], "refusal");
     }
 
     #[tokio::test]
