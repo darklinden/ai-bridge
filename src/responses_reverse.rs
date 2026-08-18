@@ -313,20 +313,26 @@ pub fn anthropic_to_responses_response(body: &Value, model: &str) -> Result<Valu
     Ok(result)
 }
 
-/// Anthropic usage → Responses usage fields (input_tokens/output_tokens match).
+/// Anthropic usage → Responses usage fields. `total_tokens` is REQUIRED by
+/// OpenAI's responses wire format (codex hard-fails parsing ResponseCompleted
+/// without it), so it is always present (input + output).
 fn build_responses_usage(usage: Option<&Value>) -> Value {
     let mut out = json!({});
+    let mut total: u64 = 0;
     if let Some(u) = usage {
-        if let Some(v) = u.get("input_tokens") {
-            out["input_tokens"] = v.clone();
+        if let Some(v) = u.get("input_tokens").and_then(Value::as_u64) {
+            out["input_tokens"] = json!(v);
+            total += v;
         }
-        if let Some(v) = u.get("output_tokens") {
-            out["output_tokens"] = v.clone();
+        if let Some(v) = u.get("output_tokens").and_then(Value::as_u64) {
+            out["output_tokens"] = json!(v);
+            total += v;
         }
-        if let Some(v) = u.get("cache_creation_input_tokens") {
-            out["input_tokens_details"]["cached_tokens"] = v.clone();
+        if let Some(v) = u.get("cache_creation_input_tokens").and_then(Value::as_u64) {
+            out["input_tokens_details"]["cached_tokens"] = json!(v);
         }
     }
+    out["total_tokens"] = json!(total);
     out
 }
 
@@ -359,6 +365,23 @@ where
         let mut content_index: usize = 0;
         let mut tool_item_count: usize = 0;
         let mut done = false;
+        // --- aggregation for the terminal snapshots codex renders from ---
+        // Anthropic streams content as deltas only; codex assembles the final
+        // reply from output_item.done / response.completed, so we must carry the
+        // accumulated text/tool state forward into those events instead of
+        // emitting them empty.
+        let mut text_acc: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+        let mut fc_meta: std::collections::BTreeMap<usize, (String, String)> = std::collections::BTreeMap::new(); // out_idx -> (call_id, name)
+        let mut fc_args: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();           // out_idx -> accumulated JSON
+        // anthropic block index -> responses output_index, plus whether it is a
+        // tool block. codex finalizes each output item via a `*.output_item.done`
+        // event; without one the function_call never becomes executable, so on
+        // content_block_stop for a tool we must emit the terminal function_call
+        // events (real OpenAI Responses sends these too).
+        let mut block_out: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        let mut block_is_tool: std::collections::BTreeMap<usize, bool> = std::collections::BTreeMap::new();
+        let mut msg_status: &str = "completed";
+        let mut response_usage: Option<Value> = None;
 
         tokio::pin!(stream);
 
@@ -405,6 +428,8 @@ where
                                     match b.get("type").and_then(Value::as_str) {
                                         Some("text") => {
                                             content_index = idx;
+                                            block_out.insert(idx, content_index);
+                                            block_is_tool.insert(idx, false);
                                             // response.output_item.added + response.content_part.added
                                             let item = json!({
                                                 "type": "response.output_item.added",
@@ -421,8 +446,12 @@ where
                                         }
                                         Some("tool_use") => {
                                             tool_item_count += 1;
+                                            block_out.insert(idx, tool_item_count);
+                                            block_is_tool.insert(idx, true);
                                             let id = b.get("id").and_then(Value::as_str).unwrap_or("");
                                             let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                                            fc_meta.insert(tool_item_count, (id.to_string(), name.to_string()));
+                                            fc_args.insert(tool_item_count, String::new());
                                             if log_resp && !resp_has_text {
                                                 reqlog.append(&format!("[tool_use: {name}]"));
                                             }
@@ -449,6 +478,7 @@ where
                                     match d.get("type").and_then(Value::as_str) {
                                         Some("text_delta") => {
                                             let text = d.get("text").and_then(Value::as_str).unwrap_or("");
+                                            text_acc.entry(content_index).or_default().push_str(text);
                                             if log_resp {
                                                 resp_has_text = true;
                                                 reqlog.append(text);
@@ -464,6 +494,7 @@ where
                                         }
                                         Some("input_json_delta") => {
                                             let partial = d.get("partial_json").and_then(Value::as_str).unwrap_or("");
+                                            fc_args.entry(tool_item_count).or_default().push_str(partial);
                                             let delta = json!({
                                                 "type": "response.function_call_arguments.delta",
                                                 "item_id": format!("fc_{}", tool_item_count),
@@ -478,16 +509,53 @@ where
                             }
                             "content_block_stop" => {
                                 let idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                                let stop = json!({
-                                    "type": "response.content_part.done",
-                                    "item_id": format!("msg_{}", idx),
-                                    "output_index": idx,
-                                    "content_index": 0,
-                                    "part": { "type": "output_text", "text": "" }
-                                });
-                                yield Ok(Bytes::from(sse_block("response.content_part.done", &stop)));
+                                if block_is_tool.get(&idx).copied().unwrap_or(false) {
+                                    // Emit the terminal function_call events so codex
+                                    // finalizes the tool as executable. Its arguments
+                                    // are complete here (all deltas accumulated above).
+                                    let oidx = block_out.get(&idx).copied().unwrap_or(idx);
+                                    let args = fc_args.get(&oidx).cloned().unwrap_or_default();
+                                    let (call_id, name) = fc_meta
+                                        .get(&oidx)
+                                        .cloned()
+                                        .unwrap_or_else(|| ("".to_string(), "".to_string()));
+                                    let args_done = json!({
+                                        "type": "response.function_call_arguments.done",
+                                        "item_id": format!("fc_{}", oidx),
+                                        "output_index": oidx,
+                                        "arguments": args
+                                    });
+                                    yield Ok(Bytes::from(sse_block("response.function_call_arguments.done", &args_done)));
+                                    let item_done = json!({
+                                        "type": "response.output_item.done",
+                                        "output_index": oidx,
+                                        "item": {
+                                            "id": format!("fc_{}", oidx),
+                                            "type": "function_call",
+                                            "call_id": call_id,
+                                            "name": name,
+                                            "arguments": args,
+                                            "status": "completed"
+                                        }
+                                    });
+                                    yield Ok(Bytes::from(sse_block("response.output_item.done", &item_done)));
+                                } else {
+                                    let part_text = text_acc.get(&idx).cloned().unwrap_or_default();
+                                    let oidx = block_out.get(&idx).copied().unwrap_or(idx);
+                                    let stop = json!({
+                                        "type": "response.content_part.done",
+                                        "item_id": format!("msg_{}", oidx),
+                                        "output_index": oidx,
+                                        "content_index": 0,
+                                        "part": { "type": "output_text", "text": part_text }
+                                    });
+                                    yield Ok(Bytes::from(sse_block("response.content_part.done", &stop)));
+                                }
                             }
                             "message_delta" => {
+                                if let Some(u) = ev.get("usage") {
+                                    response_usage = Some(u.clone());
+                                }
                                 let stop_reason = ev.get("delta")
                                     .and_then(|d| d.get("stop_reason"))
                                     .and_then(Value::as_str);
@@ -497,6 +565,13 @@ where
                                     Some("tool_use") => "in_progress",
                                     _ => "completed",
                                 };
+                                msg_status = status;
+                                let text: String = text_acc.values().cloned().collect();
+                                let content = if text.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![json!({ "type": "output_text", "text": text, "annotations": [] })]
+                                };
                                 let done_ev = json!({
                                     "type": "response.output_item.done",
                                     "output_index": content_index,
@@ -504,7 +579,7 @@ where
                                         "id": format!("msg_{}", content_index),
                                         "type": "message",
                                         "role": "assistant",
-                                        "content": [],
+                                        "content": content,
                                         "status": status
                                     }
                                 });
@@ -512,20 +587,41 @@ where
                             }
                             "message_stop" if !done => {
                                 done = true;
+                                // Assemble the final output: a single message item holding all
+                                // streamed text, followed by any completed function calls,
+                                // mirroring anthropic_to_responses_response.
+                                let text: String = text_acc.values().cloned().collect();
+                                let mut output: Vec<Value> = Vec::new();
+                                if !text.is_empty() {
+                                    output.push(json!({
+                                        "id": format!("msg_{}", content_index),
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": vec![json!({ "type": "output_text", "text": text, "annotations": [] })],
+                                        "status": msg_status
+                                    }));
+                                }
+                                for (idx, (call_id, name)) in &fc_meta {
+                                    let args = fc_args.get(idx).cloned().unwrap_or_default();
+                                    output.push(json!({
+                                        "id": format!("fc_{}", idx),
+                                        "type": "function_call",
+                                        "call_id": call_id,
+                                        "name": name,
+                                        "arguments": args,
+                                        "status": "completed"
+                                    }));
+                                }
                                 let completed = json!({
                                     "type": "response.completed",
                                     "response": {
                                         "id": response_id,
                                         "object": "response",
                                         "created_at": 0,
-                                        "status": "completed",
+                                        "status": msg_status,
                                         "model": current_model,
-                                        "output": [],
-                                        "usage": {
-                                            "input_tokens": 0,
-                                            "output_tokens": 0,
-                                            "total_tokens": 0
-                                        }
+                                        "output": output,
+                                        "usage": build_responses_usage(response_usage.as_ref())
                                     }
                                 });
                                 yield Ok(Bytes::from(sse_block("response.completed", &completed)));
@@ -732,6 +828,7 @@ mod tests {
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n".to_string(),
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"get_weather\"}}\n\n".to_string(),
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"tokyo\\\"}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n".to_string(),
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
         ];
@@ -750,5 +847,25 @@ mod tests {
             .filter_map(|(_, v)| v.get("delta").and_then(Value::as_str))
             .collect();
         assert_eq!(arg_deltas, vec!["{\"city\":\"tokyo\"}"]);
+
+        // codex finalizes a tool from its terminal events: it must receive a
+        // `function_call_arguments.done` and a function_call `output_item.done`
+        // (with the fully assembled arguments) or the tool is never executed.
+        let args_done = out
+            .iter()
+            .find(|(e, _)| e == "response.function_call_arguments.done")
+            .map(|(_, v)| v.clone())
+            .expect("function_call_arguments.done emitted");
+        assert_eq!(args_done["arguments"], "{\"city\":\"tokyo\"}");
+
+        let fc_done = out
+            .iter()
+            .find(|(e, v)| e == "response.output_item.done" && v["item"]["type"] == "function_call")
+            .map(|(_, v)| v.clone())
+            .expect("function_call output_item.done emitted");
+        assert_eq!(fc_done["item"]["call_id"], "t_1");
+        assert_eq!(fc_done["item"]["name"], "get_weather");
+        assert_eq!(fc_done["item"]["arguments"], "{\"city\":\"tokyo\"}");
+        assert_eq!(fc_done["item"]["status"], "completed");
     }
 }
