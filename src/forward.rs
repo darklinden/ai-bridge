@@ -57,6 +57,11 @@ pub(crate) struct Config {
     pub(crate) override_headers: HeaderMap,
     /// Optional separately configured vision model for image description.
     pub(crate) vision: Option<VisionConfig>,
+    /// Whether the third-party vision supplement is enabled
+    /// (`THIRDPARTY_VISION_SUPPLEMENT`, default off). When off, images pass
+    /// through to the upstream untouched so the upstream's own vision handles
+    /// them; when on, text-only upstreams get the VISION_* describe/strip path.
+    pub(crate) vision_supplement_enabled: bool,
 }
 
 impl Config {
@@ -67,6 +72,7 @@ impl Config {
     ///           `LISTEN_ADDR` (default: `0.0.0.0`),
     ///           `LISTEN_PORT` (default: `18650`),
     ///           `UPSTREAM_AUTH_KEY`, `UPSTREAM_HEADERS`,
+    ///           `THIRDPARTY_VISION_SUPPLEMENT`,
     ///           `VISION_URL` / `VISION_API_KEY` / `VISION_MODEL` / `VISION_HEADERS`
     pub fn from_env() -> Result<Self, Error> {
         reject_legacy_env()?;
@@ -98,6 +104,10 @@ impl Config {
         }
 
         let vision = parse_vision_config()?;
+        let vision_supplement_enabled = parse_bool(
+            std::env::var("THIRDPARTY_VISION_SUPPLEMENT").ok().as_deref(),
+            false,
+        );
 
         Ok(Self {
             upstream_type,
@@ -109,6 +119,7 @@ impl Config {
             auth_key,
             override_headers,
             vision,
+            vision_supplement_enabled,
         })
     }
 }
@@ -252,6 +263,16 @@ fn parse_header_overrides(raw: &str) -> HeaderMap {
         headers.insert(name, value);
     }
     headers
+}
+
+/// Parse a boolean config value: `1|true|yes|on` → true, `0|false|no|off` →
+/// false; anything else (including a missing value) → `default`.
+fn parse_bool(raw: Option<&str>, default: bool) -> bool {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => default,
+    }
 }
 
 /// Shared application state holding configuration and an HTTP client with connection pooling.
@@ -469,8 +490,32 @@ pub(crate) async fn forward_to_responses_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_header_overrides, parse_vision_config_with, UpstreamType};
+    use super::{parse_bool, parse_header_overrides, parse_vision_config_with, UpstreamType};
     use std::collections::HashMap;
+
+    #[test]
+    fn parse_bool_maps_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes ", "YES", "on", "On", " 1 "] {
+            assert!(parse_bool(Some(value), false), "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_maps_falsy_values() {
+        for value in ["0", "false", "FALSE", " no ", "off", "Off"] {
+            assert!(!parse_bool(Some(value), true), "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_defaults_on_missing_or_invalid() {
+        // Missing and unrecognized values fall back to the given default.
+        assert!(!parse_bool(None, false));
+        assert!(parse_bool(None, true));
+        for value in ["", "   ", "maybe", "2", "tru"] {
+            assert!(!parse_bool(Some(value), false), "value: {value:?}");
+        }
+    }
 
     #[test]
     fn upstream_type_accepts_all_three_values() {

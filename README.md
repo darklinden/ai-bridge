@@ -82,6 +82,7 @@ All configuration is via environment variables (or `.env`). The upstream format 
 | `UPSTREAM_HEADERS` | | *(none)* | Extra upstream headers, format `A:a\|B:b` (pipe-separated, split on first `:`). Overrides default headers; last duplicate wins. |
 | `LISTEN_ADDR` | | `0.0.0.0` | Bind address. |
 | `LISTEN_PORT` | | `18650` | Bind port. |
+| `THIRDPARTY_VISION_SUPPLEMENT` | | `off` | Optional toggle for the vision supplement feature. Off (default): images pass through to the upstream untouched, letting the upstream's own vision handle them. On (`1`/`true`/`yes`/`on`): text-only upstreams get the `VISION_*` describe path (or `[Unsupported Image]` fallback). |
 | `VISION_URL` / `VISION_API_KEY` / `VISION_MODEL` | | *(unset)* | Vision model config (all three required to enable). Endpoint format is detected from the URL (`/responses`, `/messages`, else chat). |
 | `VISION_HEADERS` | | *(none)* | Extra headers for vision requests, same format as `UPSTREAM_HEADERS`. |
 | `VISION_PROMPT_MODE` | | `auto` | Vision description prompt template: `auto` (self-routes UI vs general), `general`, `ui`, or `compact`. Unknown values fall back to `auto`. Ignored when `VISION_PROMPT` is set. |
@@ -146,7 +147,7 @@ Each request/response pair is printed to stdout as single-line records, independ
 
 ## Media & vision
 
-When the upstream model is confirmed text-only, image blocks are preprocessed before forwarding:
+By default (with `THIRDPARTY_VISION_SUPPLEMENT` unset) images are passed through to the upstream untouched, so the upstream's own vision handles them. When `THIRDPARTY_VISION_SUPPLEMENT` is enabled and the upstream model is confirmed text-only, image blocks are preprocessed before forwarding:
 
 - If a vision model is configured (`VISION_URL` + `VISION_API_KEY` + `VISION_MODEL`), all images in the request are described in a single non-streaming vision call and the image blocks are replaced with the resulting text. Descriptions come from a built-in prompt template selected by `VISION_PROMPT_MODE` (`auto` self-routes UI screenshots to a UI-reconstruction structure and other images to a general structure), or from a custom `VISION_PROMPT`; `VISION_MAX_TOKENS` caps the description length. Each image is labeled by its document position (`[Image N]`), which stays correct when only a subset of images is uncached. Results are cached in-process keyed by image fingerprint with a TTL; a vision failure degrades to `[Unsupported Image]` and never blocks the request.
 - Otherwise images are stripped and replaced with an `[Unsupported Image]` placeholder.

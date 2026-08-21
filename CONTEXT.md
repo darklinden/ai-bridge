@@ -17,7 +17,7 @@ _Avoid_: 本地接口, endpoint, route
 _Avoid_: 日志服务, log file, telemetry
 
 **Media description**:
-当本地请求携带图片、而 Upstream 是纯文本模型时，由配置的视觉模型（`VISION_*`）把图片转成文字描述，替换图片块后再转发。多图一次联合分析，结果按图片指纹做进程内缓存。
+当本地请求携带图片、而 Upstream 是纯文本模型时，由配置的视觉模型（`VISION_*`）把图片转成文字描述，替换图片块后再转发。多图一次联合分析，结果按图片指纹做进程内缓存。该补充功能由 `THIRDPARTY_VISION_SUPPLEMENT` 开关控制，默认关闭时图片原样透传给上游（由其自身 vision 处理）。
 _Avoid_: image-to-text, vision, image placeholder
 
 **Upstream type detection**:

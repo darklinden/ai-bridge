@@ -60,6 +60,14 @@ async fn main() -> Result<(), Error> {
     } else {
         println!("  → VISION = (not configured)");
     }
+    println!(
+        "  → THIRDPARTY_VISION_SUPPLEMENT = {}",
+        if state.config.vision_supplement_enabled {
+            "ON"
+        } else {
+            "OFF (images pass through to upstream vision)"
+        }
+    );
 
     let app = server::build_router(state);
 

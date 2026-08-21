@@ -265,6 +265,11 @@ async fn preprocess_media(
     entry: LocalEntry,
     state: &AppState,
 ) -> Result<usize, Error> {
+    // Third-party vision supplement disabled → images pass through to the
+    // upstream untouched so the upstream's own vision handles them.
+    if !state.config.vision_supplement_enabled {
+        return Ok(0);
+    }
     if !crate::media_sanitizer::is_confirmed_text_only_model(&state.config.model) {
         return Ok(0);
     }
