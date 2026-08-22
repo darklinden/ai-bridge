@@ -462,26 +462,16 @@ async fn handle_passthrough(
     entry: LocalEntry,
 ) -> Result<Response<Body>, Error> {
     if is_stream {
-        let upstream_resp = crate::forward::forward_to_zen_streaming(
+        let upstream_resp = match crate::forward::forward_to_zen_streaming(
             body,
             &state.client,
             &upstream,
         )
-        .await?;
-        let status = upstream_resp.status();
-        if !status.is_success() {
-            let body = upstream_resp
-                .json::<Value>()
-                .await
-                .unwrap_or(json!({"error": {"message": "Unknown error"}}));
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            reqlog.err_req(&format!("upstream status {}: {message}", status.as_u16()));
-            return Ok(upstream_error_response(status, body, entry));
-        }
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(handle_forward_error(reqlog, e, entry)),
+        };
         let stream = upstream_resp.bytes_stream();
         // Log the streamed response text onto the `[RESP]` line while forwarding
         // the bytes verbatim (the local entry and upstream share a wire format).
@@ -498,10 +488,7 @@ async fn handle_passthrough(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
+            Err(e) => return Ok(handle_forward_error(reqlog, e, entry)),
         };
         reqlog.resp(&format!("stop_reason=passthrough ({model})"));
         Ok(Json(upstream_resp).into_response())
@@ -521,26 +508,16 @@ async fn handle_anthropic_entry_to_chat(
     convert::inject_openai_stream_include_usage(&mut chat_body);
 
     if is_stream {
-        let upstream_resp = crate::forward::forward_to_zen_streaming(
+        let upstream_resp = match crate::forward::forward_to_zen_streaming(
             chat_body,
             &state.client,
             &upstream,
         )
-        .await?;
-        let status = upstream_resp.status();
-        if !status.is_success() {
-            let body = upstream_resp
-                .json::<Value>()
-                .await
-                .unwrap_or(json!({"error": {"message": "Unknown error"}}));
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            reqlog.err_req(&format!("upstream status {}: {message}", status.as_u16()));
-            return Ok(upstream_error_response(status, body, ANTHROPIC_ENTRY));
-        }
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
+        };
         let stream = upstream_resp.bytes_stream();
         let anthropic_stream = convert::chat_to_anthropic_sse(stream, model.to_string(), reqlog.clone());
         Ok(sse_response(Body::from_stream(anthropic_stream)))
@@ -551,10 +528,7 @@ async fn handle_anthropic_entry_to_chat(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
+            Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
         };
         let anthropic_response = match convert::openai_to_anthropic(upstream_resp, model) {
             Ok(v) => v,
@@ -585,26 +559,16 @@ async fn handle_anthropic_entry_to_responses(
 
     if is_stream {
         responses_body["stream"] = json!(true);
-        let upstream_resp = crate::forward::forward_to_responses_streaming(
+        let upstream_resp = match crate::forward::forward_to_responses_streaming(
             responses_body,
             &state.client,
             &upstream,
         )
-        .await?;
-        let status = upstream_resp.status();
-        if !status.is_success() {
-            let body = upstream_resp
-                .json::<Value>()
-                .await
-                .unwrap_or(json!({"error": {"message": "Unknown error"}}));
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            reqlog.err_req(&format!("upstream status {}: {message}", status.as_u16()));
-            return Ok(upstream_error_response(status, body, ANTHROPIC_ENTRY));
-        }
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
+        };
         let stream = upstream_resp.bytes_stream();
         let anthropic_stream = crate::streaming_responses::responses_to_anthropic_sse(
             stream,
@@ -619,10 +583,7 @@ async fn handle_anthropic_entry_to_responses(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
+            Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
         };
         let anthropic_response = match transform_responses::responses_to_anthropic(
             upstream_resp, model,
@@ -660,26 +621,16 @@ async fn handle_chat_entry_to_anthropic(
     };
 
     if is_stream {
-        let upstream_resp = crate::forward::forward_to_zen_streaming(
+        let upstream_resp = match crate::forward::forward_to_zen_streaming(
             anthropic_body,
             &state.client,
             &upstream,
         )
-        .await?;
-        let status = upstream_resp.status();
-        if !status.is_success() {
-            let body = upstream_resp
-                .json::<Value>()
-                .await
-                .unwrap_or(json!({"error": {"message": "Unknown error"}}));
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            reqlog.err_req(&format!("upstream status {}: {message}", status.as_u16()));
-            return Ok(upstream_error_response(status, body, CHAT_ENTRY));
-        }
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(handle_forward_error(reqlog, e, CHAT_ENTRY)),
+        };
         let stream = upstream_resp.bytes_stream();
         let chat_stream = convert_reverse::anthropic_to_chat_sse(
             stream,
@@ -695,10 +646,7 @@ async fn handle_chat_entry_to_anthropic(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
+            Err(e) => return Ok(handle_forward_error(reqlog, e, CHAT_ENTRY)),
         };
         let chat_response = match convert_reverse::anthropic_to_chat_response(&upstream_resp, model) {
             Ok(v) => v,
@@ -734,26 +682,16 @@ async fn handle_chat_entry_to_responses(
 
     if is_stream {
         responses_body["stream"] = json!(true);
-        let upstream_resp = crate::forward::forward_to_responses_streaming(
+        let upstream_resp = match crate::forward::forward_to_responses_streaming(
             responses_body,
             &state.client,
             &upstream,
         )
-        .await?;
-        let status = upstream_resp.status();
-        if !status.is_success() {
-            let body = upstream_resp
-                .json::<Value>()
-                .await
-                .unwrap_or(json!({"error": {"message": "Unknown error"}}));
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            reqlog.err_req(&format!("upstream status {}: {message}", status.as_u16()));
-            return Ok(upstream_error_response(status, body, CHAT_ENTRY));
-        }
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(handle_forward_error(reqlog, e, CHAT_ENTRY)),
+        };
         let stream = upstream_resp.bytes_stream();
         // responses SSE → anthropic SSE → chat SSE (double bridge).
         let anthropic_stream =
@@ -772,10 +710,7 @@ async fn handle_chat_entry_to_responses(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
+            Err(e) => return Ok(handle_forward_error(reqlog, e, CHAT_ENTRY)),
         };
         let anthropic_mid =
             match transform_responses::responses_to_anthropic(upstream_resp, model) {
@@ -815,26 +750,16 @@ async fn handle_responses_entry_to_anthropic(
     };
 
     if is_stream {
-        let upstream_resp = crate::forward::forward_to_zen_streaming(
+        let upstream_resp = match crate::forward::forward_to_zen_streaming(
             anthropic_body,
             &state.client,
             &upstream,
         )
-        .await?;
-        let status = upstream_resp.status();
-        if !status.is_success() {
-            let body = upstream_resp
-                .json::<Value>()
-                .await
-                .unwrap_or(json!({"error": {"message": "Unknown error"}}));
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            reqlog.err_req(&format!("upstream status {}: {message}", status.as_u16()));
-            return Ok(upstream_error_response(status, body, RESPONSES_ENTRY));
-        }
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
+        };
         let stream = upstream_resp.bytes_stream();
         let responses_stream = responses_reverse::anthropic_to_responses_sse(
             stream,
@@ -850,10 +775,7 @@ async fn handle_responses_entry_to_anthropic(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
+            Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
         };
         let responses_response = match responses_reverse::anthropic_to_responses_response(
             &upstream_resp, model,
@@ -890,26 +812,16 @@ async fn handle_responses_entry_to_chat(
     convert::inject_openai_stream_include_usage(&mut chat_body);
 
     if is_stream {
-        let upstream_resp = crate::forward::forward_to_zen_streaming(
+        let upstream_resp = match crate::forward::forward_to_zen_streaming(
             chat_body,
             &state.client,
             &upstream,
         )
-        .await?;
-        let status = upstream_resp.status();
-        if !status.is_success() {
-            let body = upstream_resp
-                .json::<Value>()
-                .await
-                .unwrap_or(json!({"error": {"message": "Unknown error"}}));
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            reqlog.err_req(&format!("upstream status {}: {message}", status.as_u16()));
-            return Ok(upstream_error_response(status, body, RESPONSES_ENTRY));
-        }
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
+        };
         let stream = upstream_resp.bytes_stream();
         // chat SSE → anthropic SSE → responses SSE.
         let anthropic_stream =
@@ -928,10 +840,7 @@ async fn handle_responses_entry_to_chat(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
+            Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
         };
         let anthropic_mid = match convert::openai_to_anthropic(upstream_resp, model) {
             Ok(v) => v,
@@ -988,6 +897,24 @@ fn upstream_error_response(status: StatusCode, body: Value, entry: LocalEntry) -
                 }
             });
             (status, Json(openai_error)).into_response()
+        }
+    }
+}
+
+/// Log an upstream/forward error on the request line and shape the client
+/// response. [`Error::Upstream`] (a non-2xx upstream reply) is logged as
+/// `upstream status {code}: {reason}` and relayed with the real HTTP status;
+/// any other error keeps the existing `e.to_string()` log and maps through
+/// `into_entry_response`.
+fn handle_forward_error(reqlog: &Arc<ReqLog>, e: Error, entry: LocalEntry) -> Response<Body> {
+    match e {
+        Error::Upstream { status, reason, body } => {
+            reqlog.err_req(&format!("upstream status {}: {reason}", status.as_u16()));
+            upstream_error_response(status, body, entry)
+        }
+        other => {
+            reqlog.err_req(&other.to_string());
+            other.into_entry_response(entry)
         }
     }
 }
@@ -1393,6 +1320,65 @@ mod tests {
                 json!({"error": {"message": "boom", "type": "upstream_error"}})
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_forward_error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_forward_error_relays_upstream_status_and_reason() {
+        let reqlog = ReqLog::new();
+
+        // Anthropic entry, upstream 503 → same status + anthropic error shape.
+        let resp = handle_forward_error(
+            &reqlog,
+            Error::Upstream {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                reason: "Service Unavailable".into(),
+                body: json!({"error": {"message": "Service Unavailable"}}),
+            },
+            LocalEntry::AnthropicMessages,
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["message"], "Service Unavailable");
+
+        // OpenAI entry, upstream 429 → status relayed instead of blanket 502.
+        let resp = handle_forward_error(
+            &reqlog,
+            Error::Upstream {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                reason: "Too Many Requests".into(),
+                body: json!({"error": {"message": "Too Many Requests"}}),
+            },
+            LocalEntry::OaiChat,
+        );
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["message"], "Too Many Requests");
+    }
+
+    #[test]
+    fn handle_forward_error_non_upstream_keeps_old_mapping() {
+        let reqlog = ReqLog::new();
+        // Non-upstream forward errors still collapse to 502 via into_entry_response.
+        let resp = handle_forward_error(&reqlog, Error::Forward("boom".into()), LocalEntry::OaiChat);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn upstream_error_preserves_status_in_status_and_message() {
+        let err = Error::Upstream {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            reason: "rate limit".into(),
+            body: json!({}),
+        };
+        let (status, message) = err.status_and_message();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(message, "rate limit");
     }
 
     #[tokio::test]

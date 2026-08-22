@@ -1,6 +1,6 @@
 use crate::error::Error;
 use http::{HeaderMap, HeaderName, HeaderValue};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// The upstream API format, declared explicitly via `UPSTREAM_TYPE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +381,61 @@ fn build_upstream_request(
         .body(reqwest::Body::from(body_bytes)))
 }
 
+/// Normalize a non-2xx upstream error body into `(Value body, single-line reason)`.
+///
+/// JSON bodies contribute `error.message` (or a top-level `message`); anything
+/// unparseable falls back to the raw text. The returned reason is collapsed to
+/// one line and truncated so gateway/HTML error pages can't flood the log, and
+/// the body is guaranteed to carry `error.message == reason` so the client
+/// response and the log line always agree.
+fn parse_error_payload(text: &str) -> (Value, String) {
+    let parsed: Option<Value> = serde_json::from_str(text).ok();
+
+    let reason = parsed
+        .as_ref()
+        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()))
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()))
+        })
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_else(|| text.split_whitespace().collect::<Vec<_>>().join(" "));
+    let mut reason = reason.chars().take(500).collect::<String>();
+    if reason.is_empty() {
+        reason = "Unknown error".to_string();
+    }
+
+    let mut body = parsed.unwrap_or_else(|| json!({}));
+    if body.get("error").is_none() {
+        body["error"] = json!({});
+    }
+    body["error"]["message"] = json!(reason);
+
+    (body, reason)
+}
+
+/// Read the full body of a non-2xx upstream response into a normalized
+/// `(Value, reason)` pair via [`parse_error_payload`].
+async fn read_upstream_error(resp: reqwest::Response) -> (Value, String) {
+    let text = resp.text().await.unwrap_or_default();
+    parse_error_payload(&text)
+}
+
+/// Check an upstream response status: 2xx passes through untouched for the
+/// caller to parse/stream; otherwise the body is consumed and relayed as
+/// [`Error::Upstream`] with the real status code and an extracted reason.
+async fn ensure_upstream_success(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, Error> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let (body, reason) = read_upstream_error(response).await;
+    Err(Error::Upstream { status, reason, body })
+}
+
 /// Forward a non-streaming request to the upstream API.
 pub(crate) async fn forward_to_zen(
     request_body: Value,
@@ -392,15 +447,9 @@ pub(crate) async fn forward_to_zen(
         .await
         .map_err(|e| Error::Forward(format!("Request failed: {e}")))?;
 
+    // Non-2xx → Error::Upstream (real status + reason); 2xx → parse JSON below.
+    let response = ensure_upstream_success(response).await?;
     let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(Error::Forward(format!(
-            "Upstream error (status {}): {}",
-            status.as_u16(),
-            body
-        )));
-    }
 
     let resp_body: Value = response
         .json::<Value>()
@@ -420,7 +469,9 @@ pub(crate) async fn forward_to_zen(
     Ok(resp_body)
 }
 
-/// Forward a streaming request to the upstream API and return the raw response.
+/// Forward a streaming request to the upstream API and return the checked
+/// response. Non-2xx statuses surface as [`Error::Upstream`] so the handler
+/// only deals with clean 2xx streams (send/network failures stay `Err` too).
 pub(crate) async fn forward_to_zen_streaming(
     request_body: Value,
     client: &reqwest::Client,
@@ -431,7 +482,7 @@ pub(crate) async fn forward_to_zen_streaming(
         .await
         .map_err(|e| Error::Forward(format!("Request failed: {e}")))?;
 
-    Ok(response)
+    ensure_upstream_success(response).await
 }
 
 /// Forward a non-streaming request to a Responses API endpoint.
@@ -445,16 +496,10 @@ pub(crate) async fn forward_to_responses(
         .await
         .map_err(|e| Error::Forward(format!("Request failed: {e}")))?;
 
-    // Responses API may return errors in 2xx with status: "failed"
+    // Responses API may return errors in 2xx with status: "failed" — handled
+    // downstream by the converter; here only the wire status is checked.
+    let response = ensure_upstream_success(response).await?;
     let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(Error::Forward(format!(
-            "Upstream error (status {}): {}",
-            status.as_u16(),
-            body
-        )));
-    }
 
     let resp_body: Value = response
         .json::<Value>()
@@ -474,7 +519,8 @@ pub(crate) async fn forward_to_responses(
     Ok(resp_body)
 }
 
-/// Forward a streaming request to a Responses API endpoint and return the raw response.
+/// Forward a streaming request to a Responses API endpoint and return the
+/// checked response. Non-2xx statuses surface as [`Error::Upstream`].
 pub(crate) async fn forward_to_responses_streaming(
     request_body: Value,
     client: &reqwest::Client,
@@ -485,12 +531,15 @@ pub(crate) async fn forward_to_responses_streaming(
         .await
         .map_err(|e| Error::Forward(format!("Request failed: {e}")))?;
 
-    Ok(response)
+    ensure_upstream_success(response).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bool, parse_header_overrides, parse_vision_config_with, UpstreamType};
+    use super::{
+        parse_bool, parse_error_payload, parse_header_overrides, parse_vision_config_with,
+        UpstreamType,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -702,5 +751,57 @@ mod tests {
         // Missing VISION_API_KEY → whole vision config disabled (additive gate).
         let map = env_map(&[("VISION_URL", "http://vision/v1/chat/completions"), ("VISION_MODEL", "m")]);
         assert!(parse_vision_config_with(|name| map.get(name).cloned()).unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_error_payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_payload_uses_error_message_field() {
+        let text = r#"{"error": {"message": "Service Unavailable", "type": "overloaded_error"}}"#;
+        let (body, reason) = parse_error_payload(text);
+        assert_eq!(reason, "Service Unavailable");
+        assert_eq!(body["error"]["message"], "Service Unavailable");
+        // Other error fields are preserved.
+        assert_eq!(body["error"]["type"], "overloaded_error");
+    }
+
+    #[test]
+    fn error_payload_falls_back_to_top_level_message() {
+        let text = r#"{"message": "Too Many Requests"}"#;
+        let (body, reason) = parse_error_payload(text);
+        assert_eq!(reason, "Too Many Requests");
+        // The normalized body gains an error.message so shaping always works.
+        assert_eq!(body["error"]["message"], "Too Many Requests");
+    }
+
+    #[test]
+    fn error_payload_non_json_uses_raw_text() {
+        let text = "Service Unavailable";
+        let (body, reason) = parse_error_payload(text);
+        assert_eq!(reason, "Service Unavailable");
+        assert_eq!(body["error"]["message"], "Service Unavailable");
+    }
+
+    #[test]
+    fn error_payload_collapses_multiline_plain_text() {
+        let text = "<html>\n  <h1>502 Bad Gateway</h1>\n</html>";
+        let (_, reason) = parse_error_payload(text);
+        assert_eq!(reason, "<html> <h1>502 Bad Gateway</h1> </html>");
+    }
+
+    #[test]
+    fn error_payload_empty_body_defaults_to_unknown() {
+        let (body, reason) = parse_error_payload("");
+        assert_eq!(reason, "Unknown error");
+        assert_eq!(body["error"]["message"], "Unknown error");
+    }
+
+    #[test]
+    fn error_payload_truncates_overlong_reason() {
+        let long = "x".repeat(2000);
+        let (_, reason) = parse_error_payload(&long);
+        assert_eq!(reason.chars().count(), 500);
     }
 }

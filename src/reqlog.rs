@@ -132,18 +132,17 @@ impl ReqLog {
         self.write("\n");
     }
 
-    /// Request-phase error (no response started) — full tagged line.
+    /// Request-phase error (no response started) — full tagged line. Preceded
+    /// by two blank lines so it separates from the previous pair just like the
+    /// `[REQ #id]` / `[RESP #id]` markers.
     pub fn err_req(&self, msg: &str) {
-        self.write(&format!("[ERR-REQ #{}]: {msg}\n", self.id));
+        self.write(&format!("\n\n[ERR-REQ #{}]: {msg}\n", self.id));
     }
 
-    /// Response-phase error: break the open line, then print a tagged line.
+    /// Response-phase error: break the open line (first newline), then print a
+    /// tagged line — also preceded by two blank lines for consistent grouping.
     pub fn err_resp(&self, msg: &str) {
-        if self.header_printed.load(Ordering::SeqCst) && !self.done.load(Ordering::SeqCst) {
-            self.write(&format!("\n[ERR-RESP #{}]: {msg}\n", self.id));
-        } else {
-            self.write(&format!("[ERR-RESP #{}]: {msg}\n", self.id));
-        }
+        self.write(&format!("\n\n[ERR-RESP #{}]: {msg}\n", self.id));
         self.done();
     }
 }

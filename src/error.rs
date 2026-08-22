@@ -3,7 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use thiserror::Error;
 
 /// The local API style a request came in through. Error responses are shaped to
@@ -36,6 +36,17 @@ pub enum Error {
     /// against an Anthropic upstream). Maps to HTTP 400.
     #[error("不支持的请求: {0}")]
     Unsupported(String),
+
+    /// A non-2xx response from the upstream API. Carries the real HTTP status
+    /// so the local client sees the actual code (429/503/...) instead of a
+    /// blanket 502; `reason` is the extracted human-readable message and
+    /// `body` is the (normalized) upstream error body for response shaping.
+    #[error("上游错误 ({status}): {reason}")]
+    Upstream {
+        status: StatusCode,
+        reason: String,
+        body: Value,
+    },
 }
 
 impl From<std::num::ParseIntError> for Error {
@@ -54,6 +65,8 @@ impl Error {
             Error::Server(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             Error::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             Error::Unsupported(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            // Relay the upstream's real status code instead of blanket-502.
+            Error::Upstream { status, reason, .. } => (*status, reason.clone()),
         }
     }
 

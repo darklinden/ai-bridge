@@ -141,7 +141,13 @@ Each request/response pair is printed to stdout as single-line records, independ
 ```
 
 - Streaming text appends onto the same open `[RESP #id]: ` line, terminated on completion.
-- Errors break to a tagged `[ERR-REQ #id]` / `[ERR-RESP #id]` line.
+- Errors break to a tagged `[ERR-REQ #id]` / `[ERR-RESP #id]` line, also preceded by two blank lines like the `[REQ]`/`[RESP]` markers:
+
+  ```text
+  [ERR-REQ #0001]: upstream status 503: Service Unavailable
+  ```
+
+  `[ERR-REQ #id]` lines report the upstream HTTP status (`429`, `503`, ...) plus a human-readable reason extracted from the upstream body (JSON `error.message` or raw text), and the same real status is relayed to the client — no blanket 502.
 - Each pair is preceded by two blank lines for readability.
 - This is a terminal aid, not a durable log — nothing is written to disk.
 
