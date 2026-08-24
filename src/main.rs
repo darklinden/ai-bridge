@@ -28,7 +28,7 @@ ai-bridge — local Anthropic/OpenAI-compatible bridge to one configured upstrea
 Usage:
   ai-bridge              Load ~/.ai-bridge/default.toml
   ai-bridge <profile>    Load ~/.ai-bridge/<profile>.toml
-  ai-bridge -l, --list   List available profiles in ~/.ai-bridge/
+  ai-bridge -l, --list   List available profiles (* marks the current selection)
   ai-bridge -h, --help   Show this help";
 
 enum Cli {
@@ -127,33 +127,58 @@ async fn run(cli: Cli) -> Result<(), Error> {
     }
 }
 
-/// Print the sorted profile list. A missing or empty directory is a friendly
-/// empty state, not an error.
+/// Print the sorted profile list (`--list`). A missing or empty directory is
+/// a friendly empty state, not an error; rendering lives in
+/// [`profile_list_lines`] so the output is testable.
 fn print_profiles(base_dir: &Path) {
+    for line in profile_list_lines(base_dir) {
+        println!("{line}");
+    }
+}
+
+/// Lines printed by `--list`: one line per profile with `*` marking the
+/// persisted current selection (only when that profile actually exists), plus
+/// a hint line for the empty state.
+fn profile_list_lines(base_dir: &Path) -> Vec<String> {
     let profiles = config::list_profiles(base_dir);
     if profiles.is_empty() {
-        println!(
+        return vec![format!(
             "No profiles found in {}. Create {} to get started.",
             base_dir.display(),
             config::profile_path(base_dir, DEFAULT_PROFILE).display()
-        );
-        return;
+        )];
     }
-    println!("Available profiles in {}:", base_dir.display());
+    let current = config::current_profile(base_dir);
+    let mut lines = vec![format!("Available profiles in {}:", base_dir.display())];
     for name in &profiles {
-        let marker = if name == DEFAULT_PROFILE { "*" } else { " " };
-        println!("  {marker} {name}");
+        let marker = if current.as_deref() == Some(name.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        lines.push(format!("  {marker} {name}"));
     }
+    lines
 }
 
 async fn run_server(profile: &str) -> Result<(), Error> {
     config::validate_profile_name(profile)?;
     let base_dir = config::home_config_dir()?;
+    let loaded = config::load_profile(&base_dir, profile)?;
+    // Record the current selection in ~/.ai-bridge/.settings.toml. Best
+    // effort: warn, never fail, so a read-only config dir still serves
+    // (same philosophy as write_default_template).
+    if let Err(e) = config::save_current_profile(&base_dir, &loaded.name) {
+        tracing::warn!(
+            "Could not record \"{}\" as the current profile: {e}",
+            loaded.name
+        );
+    }
     let LoadedProfile {
         name,
         path,
         config,
-    } = config::load_profile(&base_dir, profile)?;
+    } = loaded;
     let state = Arc::new(AppState::new(config)?);
 
     let addr = format!("{}:{}", state.config.listen_addr, state.config.listen_port);
@@ -236,14 +261,54 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cli, Cli};
+    use super::{config, parse_cli, profile_list_lines, Cli};
     use std::ffi::OsString;
+    use tempfile::tempdir;
 
     fn cli(args: &[&str]) -> Result<Cli, String> {
         let os: Vec<OsString> = std::iter::once(OsString::from("ai-bridge"))
             .chain(args.iter().map(OsString::from))
             .collect();
         parse_cli(&os)
+    }
+
+    const MINIMAL_TOML: &str =
+        "upstream_type = \"oai-chat\"\nurl = \"https://x.example/v1/chat/completions\"\napi_key = \"k\"\n";
+
+    fn write_profile(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(format!("{name}.toml")), MINIMAL_TOML).expect("write profile");
+    }
+
+    #[test]
+    fn profile_list_lines_marks_current() {
+        let dir = tempdir().unwrap();
+        write_profile(dir.path(), "a");
+        write_profile(dir.path(), "b");
+        config::save_current_profile(dir.path(), "a").unwrap();
+
+        let lines = profile_list_lines(dir.path());
+        assert!(lines.iter().any(|l| l == "  * a"), "a is current: {lines:?}");
+        assert!(lines.iter().any(|l| l == "    b"), "b unmarked: {lines:?}");
+    }
+
+    #[test]
+    fn profile_list_lines_no_star_when_current_missing() {
+        let dir = tempdir().unwrap();
+        write_profile(dir.path(), "a");
+        // Point the settings file at a profile that no longer exists.
+        config::save_current_profile(dir.path(), "ghost").unwrap();
+
+        let lines = profile_list_lines(dir.path());
+        assert!(lines.iter().any(|l| l == "    a"));
+        assert!(!lines.iter().any(|l| l.starts_with("  *")), "no star: {lines:?}");
+    }
+
+    #[test]
+    fn profile_list_lines_empty_dir_hint() {
+        let dir = tempdir().unwrap();
+        let lines = profile_list_lines(dir.path());
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("No profiles found in"));
     }
 
     #[test]

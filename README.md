@@ -77,7 +77,7 @@ Existing files are never overwritten. Copy `default.toml` under another name to 
 | --- | --- |
 | `ai-bridge` | Serve using `~/.ai-bridge/default.toml`. |
 | `ai-bridge <profile>` | Serve using `~/.ai-bridge/<profile>.toml`. Profile names accept letters, digits, `_`, `-`. |
-| `ai-bridge -l`, `--list` | List available profiles (`*` marks `default`). Missing/empty directory prints a hint, not an error. |
+| `ai-bridge -l`, `--list` | List available profiles (`*` marks the current selection). Missing/empty directory prints a hint, not an error. |
 | `ai-bridge -h`, `--help` | Show usage. |
 
 Startup config problems exit with status 1 and a `配置错误:` message naming the exact file and cause (missing file, TOML syntax, unknown key, missing required key); CLI misuse exits with status 2 plus usage.
@@ -85,6 +85,8 @@ Startup config problems exit with status 1 and a `配置错误:` message naming 
 ## Configuration
 
 One file = one upstream configuration, stored as `~/.ai-bridge/<profile>.toml` (ADR-0005). Unknown keys are rejected at startup to catch typos.
+
+Every successful launch records the served profile in `~/.ai-bridge/.settings.toml` — a dot-prefixed file auto-managed by `ai-bridge` that holds `current_profile = "<name>"` (so `ai-bridge a` then `ai-bridge b` switches the recorded selection). `--list` marks the current selection with `*` and ignores all dot-prefixed files, so the settings file never shows up as a profile; a missing or corrupt settings file only means `--list` shows no marker. Saving the selection is best-effort: a read-only config dir still serves, with a WARN.
 
 ```toml
 # ---- required ----
@@ -213,6 +215,7 @@ Add tests alongside conversion changes — especially `streaming_responses`, whi
   - [0003: Upstream config renamed to `UPSTREAM_*`](docs/adr/0003-upstream-naming.md)
   - [0004: Media description via a vision model](docs/adr/0004-media-description-via-vision-model.md)
   - [0005: Configuration moves from environment variables to TOML profiles](docs/adr/0005-toml-profile-config.md)
+  - [0006: Current profile selection is persisted in `.settings.toml`](docs/adr/0006-current-profile-selection.md)
 
 ## Acknowledgments
 

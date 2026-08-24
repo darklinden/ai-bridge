@@ -47,15 +47,16 @@ Three layers, in dependency order:
 ## Key invariants to preserve
 
 - **Upstream format is explicit** — declared by the profile's `upstream_type` key (required, one of `anthropic-messages | oai-chat | oai-responses`), never inferred from the URL. Keep it that way; Anthropic URLs contain no `/responses` marker.
-- **Configuration is TOML profiles, not env vars** (ADR-0005) — profiles live at `~/.ai-bridge/<name>.toml` with required keys `upstream_type` / `url` / `api_key`, optional tables `[headers]` / `[reasoning]` / `[vision]`, parsed by `config::load_profile`. Unknown keys are rejected (`deny_unknown_fields`). The former `UPSTREAM_*` / `VISION_*` / `LISTEN_*` environment variables are removed and must not be reintroduced; the only env var read is `RUST_LOG` (tracing convention).
+- **Configuration is TOML profiles, not env vars** (ADR-0005) — profiles live at `~/.ai-bridge/<name>.toml` with required keys `upstream_type` / `url` / `api_key`, optional tables `[headers]` / `[reasoning]` / `[vision]`, parsed by `config::load_profile`. Unknown keys are rejected (`deny_unknown_fields`). The former `UPSTREAM_*` / `VISION_*` / `LISTEN_*` environment variables are removed and must not be reintroduced; the only env var read is `RUST_LOG` (tracing convention). The last served profile is recorded in the dot-prefixed, auto-managed `~/.ai-bridge/.settings.toml` (`config::current_profile` / `config::save_current_profile`).
 - **Outbound effort has no per-model logic** — the outgoing `reasoning_effort` / `reasoning.effort` value comes solely from `[reasoning] effort` (default `max`), stamped by `forward::apply_reasoning_policy` in every pipeline (including pass-through); conversions only decide *presence* (`convert::thinking_requested`), and a thinking-disabled request never gains an effort field. Do not reintroduce model-name-based effort mapping.
 - **Model is always overridden** to the profile's `model` — client-supplied `model` is ignored on all local entries.
 - **Anthropic upstream auth** uses `x-api-key` + `anthropic-version: 2023-06-01`; OpenAI upstreams use `Authorization: Bearer`.
 - **Error format follows the local entry**, not the upstream.
 - **OpenAI-only fields that Anthropic cannot represent** are dropped with a WARN; `n > 1` is rejected (400) because Anthropic is single-output; `parallel_tool_calls=false` maps to `tool_choice.disable_parallel_tool_use`.
 - **Prompt-cache stability matters** — tool-result payloads that are byte-identical reuse upstream prompt caches. Use `json_canonical::canonical_json_string` for cache-sensitive payloads; do not reorder keys casually.
+- **Current-selection persistence is best-effort** — every successful launch writes the served profile to `~/.ai-bridge/.settings.toml` (via `config::save_current_profile` in `run_server`); a write failure must only WARN, never block serving, mirroring `write_default_template`. `--list` marks the current selection with `*` and ignores all dot-prefixed files; a missing or corrupt settings file only means no marker, never an error.
 - **Add tests alongside conversion changes** — `streaming_responses` has none and is the riskiest untested surface; conversion modules expect inline `#[cfg(test)]` tests.
 
 ## Terminology
 
-See `CONTEXT.md` for the glossary (Upstream, Local entry, Request log, Media description). Architectural decisions live in `docs/adr/0001-0005`.
+See `CONTEXT.md` for the glossary (Upstream, Local entry, Request log, Media description). Architectural decisions live in `docs/adr/0001-0006`.

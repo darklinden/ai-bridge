@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 pub(crate) const CONFIG_DIR_NAME: &str = ".ai-bridge";
 pub(crate) const DEFAULT_PROFILE: &str = "default";
 
+/// Hidden settings file recording the last served profile (`current_profile`
+/// key). Dot-prefixed so profile discovery (`list_profiles`) and profile-name
+/// validation ignore it — no reserved name is needed.
+pub(crate) const SETTINGS_FILE: &str = ".settings.toml";
+
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1";
 const DEFAULT_LISTEN_PORT: u16 = 18650;
@@ -32,6 +37,10 @@ const DEFAULT_TEMPLATE: &str = r#"# ai-bridge 配置档案（profile）——本
 #
 # 一份文件 = 一个上游配置；可复制本文件为其他名字建立多套配置。
 # 所有行均为注释 —— 取消注释并填入真实值后才能启动。
+#
+# 每成功启动一次，所用 profile 的名字会记入 ~/.ai-bridge/.settings.toml
+# （点前缀隐藏文件，ai-bridge 自动维护）；ai-bridge --list 用 * 标记当前选择，
+# 并忽略所有点前缀文件。
 
 # ===================== 必填 =====================
 
@@ -195,8 +204,10 @@ fn write_default_template(base_dir: &Path) -> std::io::Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-/// Sorted stems of the `*.toml` regular files in `base_dir`; an empty or
-/// missing directory yields an empty list (`--list` is never an error).
+/// Sorted stems of the `*.toml` regular files in `base_dir`, ignoring
+/// dot-prefixed files (`.settings.toml` and any other hidden file are internal,
+/// not profiles); an empty or missing directory yields an empty list (`--list`
+/// is never an error).
 pub(crate) fn list_profiles(base_dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(base_dir) else {
         return Vec::new();
@@ -206,11 +217,56 @@ pub(crate) fn list_profiles(base_dir: &Path) -> Vec<String> {
         .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
+            if name.starts_with('.') {
+                return None;
+            }
             name.strip_suffix(".toml").map(str::to_string)
         })
         .collect();
     names.sort();
     names
+}
+
+// ---------------------------------------------------------------------------
+// Current-profile selection (`.settings.toml`)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn settings_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(SETTINGS_FILE)
+}
+
+/// Best-effort read of the persisted current profile. A missing file, invalid
+/// TOML, or a missing key all degrade to `None` — `--list` must never fail
+/// because of a broken settings file.
+pub(crate) fn current_profile(base_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(settings_path(base_dir)).ok()?;
+    toml::from_str::<RawSettings>(&text).ok()?.current_profile
+}
+
+/// Loose parse target for the auto-managed settings file: extra keys a user
+/// might hand-edit are ignored (no `deny_unknown_fields`).
+#[derive(Deserialize)]
+struct RawSettings {
+    current_profile: Option<String>,
+}
+
+/// Persist `name` as the current profile, creating the config directory and
+/// settings file if missing. IO failure → `Error::Config`; the caller decides
+/// whether that is fatal (it is not — servers keep serving read-only setups).
+pub(crate) fn save_current_profile(base_dir: &Path, name: &str) -> Result<(), Error> {
+    std::fs::create_dir_all(base_dir)
+        .map_err(|e| Error::Config(format!("Could not create {}: {e}", base_dir.display())))?;
+    let text = format!(
+        "# Auto-managed by ai-bridge: records the last profile served.\n\
+         # `ai-bridge --list` marks it with *.\n\
+         current_profile = \"{name}\"\n"
+    );
+    std::fs::write(settings_path(base_dir), text).map_err(|e| {
+        Error::Config(format!(
+            "Could not record current profile in {}: {e}",
+            settings_path(base_dir).display()
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -375,8 +431,9 @@ fn build_vision_config(raw: RawVision) -> Option<VisionConfig> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_vision_config, config_dir, list_profiles, load_profile, profile_path,
-        validate_profile_name, write_default_template, LoadedProfile, RawVision, DEFAULT_PROFILE,
+        build_vision_config, config_dir, current_profile, list_profiles, load_profile,
+        profile_path, save_current_profile, settings_path, validate_profile_name,
+        write_default_template, LoadedProfile, RawVision, DEFAULT_PROFILE, SETTINGS_FILE,
     };
     use crate::forward::{ReasoningEffortOverride, UpstreamType};
     use std::fs;
@@ -785,5 +842,87 @@ X-V = "1"
     #[test]
     fn list_profiles_missing_directory_is_empty() {
         assert!(list_profiles(Path::new("/nonexistent/ai-bridge-test")).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Current-profile selection (`.settings.toml`)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_current_profile_roundtrip() {
+        let dir = tempdir().unwrap();
+        save_current_profile(dir.path(), "a").expect("save a");
+        assert_eq!(current_profile(dir.path()).as_deref(), Some("a"));
+        assert!(settings_path(dir.path()).is_file());
+
+        save_current_profile(dir.path(), "b").expect("switch to b");
+        assert_eq!(current_profile(dir.path()).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn save_current_profile_creates_missing_dir() {
+        let base = tempdir().unwrap();
+        let missing = base.path().join("does-not-exist");
+        save_current_profile(&missing, "a").expect("save into missing dir");
+        assert_eq!(current_profile(&missing).as_deref(), Some("a"));
+        assert!(settings_path(&missing).is_file());
+    }
+
+    #[test]
+    fn current_profile_missing_file_is_none() {
+        let dir = tempdir().unwrap();
+        assert!(current_profile(dir.path()).is_none());
+    }
+
+    #[test]
+    fn current_profile_corrupt_settings_is_none() {
+        let dir = tempdir().unwrap();
+        fs::write(settings_path(dir.path()), "not a toml [[[").unwrap();
+        assert!(current_profile(dir.path()).is_none());
+    }
+
+    #[test]
+    fn current_profile_without_key_is_none() {
+        let dir = tempdir().unwrap();
+        fs::write(settings_path(dir.path()), "# only a comment\n").unwrap();
+        assert!(current_profile(dir.path()).is_none());
+    }
+
+    #[test]
+    fn current_profile_tolerates_unknown_keys() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            settings_path(dir.path()),
+            "current_profile = \"a\"\nother_key = 1\n",
+        )
+        .unwrap();
+        assert_eq!(current_profile(dir.path()).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn list_profiles_ignores_dotfiles() {
+        let dir = tempdir().unwrap();
+        write_profile(dir.path(), "default", "");
+        write_profile(dir.path(), "a", "");
+        fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "current_profile = \"a\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".hidden.toml"), "").unwrap();
+        assert_eq!(list_profiles(dir.path()), vec!["a", "default"]);
+    }
+
+    #[test]
+    fn settings_name_is_not_reserved() {
+        // `settings` is a legal profile name — only the dot-prefixed
+        // `.settings.toml` is internal.
+        let dir = tempdir().unwrap();
+        write_profile(dir.path(), "settings", MINIMAL_TOML);
+        assert_eq!(list_profiles(dir.path()), vec!["settings"]);
+        assert_eq!(
+            load_profile(dir.path(), "settings").expect("loads").name,
+            "settings"
+        );
     }
 }
