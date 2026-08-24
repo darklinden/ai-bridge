@@ -17,31 +17,31 @@ pub(crate) enum LocalEntry {
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("格式转换错误: {0}")]
+    #[error("format conversion error: {0}")]
     Transform(String),
 
-    #[error("转发失败: {0}")]
+    #[error("upstream relay failed: {0}")]
     Forward(String),
 
-    #[error("配置错误: {0}")]
+    #[error("configuration error: {0}")]
     Config(String),
 
-    #[error("服务器错误: {0}")]
+    #[error("server error: {0}")]
     Server(String),
 
-    #[error("未授权: {0}")]
+    #[error("unauthorized: {0}")]
     Unauthorized(String),
 
     /// A request feature the upstream format cannot represent (e.g. `n > 1`
     /// against an Anthropic upstream). Maps to HTTP 400.
-    #[error("不支持的请求: {0}")]
+    #[error("unsupported request: {0}")]
     Unsupported(String),
 
     /// A non-2xx response from the upstream API. Carries the real HTTP status
     /// so the local client sees the actual code (429/503/...) instead of a
     /// blanket 502; `reason` is the extracted human-readable message and
     /// `body` is the (normalized) upstream error body for response shaping.
-    #[error("上游错误 ({status}): {reason}")]
+    #[error("upstream error ({status}): {reason}")]
     Upstream {
         status: StatusCode,
         reason: String,
