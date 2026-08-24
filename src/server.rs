@@ -1,7 +1,7 @@
 use crate::convert;
 use crate::convert_reverse;
 use crate::error::{Error, LocalEntry};
-use crate::forward::{AppState, UpstreamTarget, UpstreamType};
+use crate::forward::{apply_reasoning_policy, AppState, UpstreamTarget, UpstreamType};
 use crate::reqlog::ReqLog;
 use crate::responses_reverse;
 use crate::transform_responses;
@@ -121,7 +121,7 @@ const ANTHROPIC_ENTRY: LocalEntry = LocalEntry::AnthropicMessages;
 const CHAT_ENTRY: LocalEntry = LocalEntry::OaiChat;
 const RESPONSES_ENTRY: LocalEntry = LocalEntry::OaiResponses;
 
-/// Authenticate the inbound request against `UPSTREAM_AUTH_KEY` if configured.
+/// Authenticate the inbound request against the profile's `auth_key` if configured.
 /// Accepts `x-api-key` or `Authorization: Bearer`; exact match required.
 fn authenticate(headers: &HeaderMap, expected: Option<&str>) -> Result<(), Error> {
     if let Some(expected) = expected {
@@ -280,6 +280,30 @@ async fn preprocess_media(
         None => Ok(crate::media_sanitizer::replace_images_for_text_only_model(
             body, &state.config.model,
         )),
+    }
+}
+
+/// Whether the local-entry request asks for reasoning at all — any effort /
+/// thinking signal other than an explicit disable. Only then does the outbound
+/// reasoning policy stamp a `Set` effort value (`apply_reasoning_policy`); an
+/// explicitly disabled request never gains an effort field.
+fn reasoning_requested_for_entry(body: &Value, entry: LocalEntry) -> bool {
+    let not_disabled = |effort: &str| {
+        !matches!(
+            effort.to_ascii_lowercase().as_str(),
+            "none" | "disable" | "disabled"
+        )
+    };
+    match entry {
+        LocalEntry::AnthropicMessages => convert::thinking_requested(body),
+        LocalEntry::OaiChat => body
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .is_some_and(not_disabled),
+        LocalEntry::OaiResponses => body
+            .pointer("/reasoning/effort")
+            .and_then(Value::as_str)
+            .is_some_and(not_disabled),
     }
 }
 
@@ -454,13 +478,20 @@ async fn handle_responses_local(
 /// only model override (already done) and stream pass-through; no conversion.
 async fn handle_passthrough(
     state: Arc<AppState>,
-    body: Value,
+    mut body: Value,
     is_stream: bool,
     model: &str,
     reqlog: &Arc<ReqLog>,
     upstream: UpstreamTarget,
     entry: LocalEntry,
 ) -> Result<Response<Body>, Error> {
+    let wants_reasoning = reasoning_requested_for_entry(&body, entry);
+    apply_reasoning_policy(
+        &mut body,
+        upstream.upstream_type,
+        &state.config.reasoning_policy,
+        wants_reasoning,
+    );
     if is_stream {
         let upstream_resp = match crate::forward::forward_to_zen_streaming(
             body,
@@ -504,7 +535,14 @@ async fn handle_anthropic_entry_to_chat(
     reqlog: &Arc<ReqLog>,
     upstream: UpstreamTarget,
 ) -> Result<Response<Body>, Error> {
+    let wants_reasoning = reasoning_requested_for_entry(&body, ANTHROPIC_ENTRY);
     let mut chat_body = convert::anthropic_to_openai_with_reasoning_content(body, true)?;
+    apply_reasoning_policy(
+        &mut chat_body,
+        UpstreamType::OaiChat,
+        &state.config.reasoning_policy,
+        wants_reasoning,
+    );
     convert::inject_openai_stream_include_usage(&mut chat_body);
 
     if is_stream {
@@ -555,7 +593,14 @@ async fn handle_anthropic_entry_to_responses(
     reqlog: &Arc<ReqLog>,
     upstream: UpstreamTarget,
 ) -> Result<Response<Body>, Error> {
+    let wants_reasoning = reasoning_requested_for_entry(&body, ANTHROPIC_ENTRY);
     let mut responses_body = transform_responses::anthropic_to_responses(body)?;
+    apply_reasoning_policy(
+        &mut responses_body,
+        UpstreamType::OaiResponses,
+        &state.config.reasoning_policy,
+        wants_reasoning,
+    );
 
     if is_stream {
         responses_body["stream"] = json!(true);
@@ -612,13 +657,20 @@ async fn handle_chat_entry_to_anthropic(
     reqlog: &Arc<ReqLog>,
     upstream: UpstreamTarget,
 ) -> Result<Response<Body>, Error> {
-    let anthropic_body = match convert_reverse::chat_to_anthropic_request(&body) {
+    let wants_reasoning = reasoning_requested_for_entry(&body, CHAT_ENTRY);
+    let mut anthropic_body = match convert_reverse::chat_to_anthropic_request(&body) {
         Ok(v) => v,
         Err(e) => {
             reqlog.err_req(&e.to_string());
             return Err(e);
         }
     };
+    apply_reasoning_policy(
+        &mut anthropic_body,
+        UpstreamType::AnthropicMessages,
+        &state.config.reasoning_policy,
+        wants_reasoning,
+    );
 
     if is_stream {
         let upstream_resp = match crate::forward::forward_to_zen_streaming(
@@ -678,7 +730,14 @@ async fn handle_chat_entry_to_responses(
             return Err(e);
         }
     };
+    let wants_reasoning = reasoning_requested_for_entry(&body, CHAT_ENTRY);
     let mut responses_body = transform_responses::anthropic_to_responses(anthropic_mid)?;
+    apply_reasoning_policy(
+        &mut responses_body,
+        UpstreamType::OaiResponses,
+        &state.config.reasoning_policy,
+        wants_reasoning,
+    );
 
     if is_stream {
         responses_body["stream"] = json!(true);
@@ -741,13 +800,20 @@ async fn handle_responses_entry_to_anthropic(
     reqlog: &Arc<ReqLog>,
     upstream: UpstreamTarget,
 ) -> Result<Response<Body>, Error> {
-    let anthropic_body = match responses_reverse::responses_to_anthropic_request(&body) {
+    let wants_reasoning = reasoning_requested_for_entry(&body, RESPONSES_ENTRY);
+    let mut anthropic_body = match responses_reverse::responses_to_anthropic_request(&body) {
         Ok(v) => v,
         Err(e) => {
             reqlog.err_req(&e.to_string());
             return Err(e);
         }
     };
+    apply_reasoning_policy(
+        &mut anthropic_body,
+        UpstreamType::AnthropicMessages,
+        &state.config.reasoning_policy,
+        wants_reasoning,
+    );
 
     if is_stream {
         let upstream_resp = match crate::forward::forward_to_zen_streaming(
@@ -808,7 +874,14 @@ async fn handle_responses_entry_to_chat(
             return Err(e);
         }
     };
+    let wants_reasoning = reasoning_requested_for_entry(&body, RESPONSES_ENTRY);
     let mut chat_body = convert::anthropic_to_openai_with_reasoning_content(anthropic_mid, true)?;
+    apply_reasoning_policy(
+        &mut chat_body,
+        UpstreamType::OaiChat,
+        &state.config.reasoning_policy,
+        wants_reasoning,
+    );
     convert::inject_openai_stream_include_usage(&mut chat_body);
 
     if is_stream {
@@ -1272,6 +1345,41 @@ mod tests {
             request_text_for_entry(&no_user, LocalEntry::OaiResponses),
             "(no messages)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reasoning-request detection (feeds apply_reasoning_policy)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reasoning_requested_for_entry_variants() {
+        // Anthropic entry: thinking_requested semantics.
+        let enabled = json!({"thinking": {"type": "enabled", "budget_tokens": 32000}});
+        assert!(reasoning_requested_for_entry(&enabled, LocalEntry::AnthropicMessages));
+        let adaptive = json!({"thinking": {"type": "adaptive"}});
+        assert!(reasoning_requested_for_entry(&adaptive, LocalEntry::AnthropicMessages));
+        let disabled = json!({"thinking": {"type": "disabled"}});
+        assert!(!reasoning_requested_for_entry(&disabled, LocalEntry::AnthropicMessages));
+        let absent = json!({"messages": []});
+        assert!(!reasoning_requested_for_entry(&absent, LocalEntry::AnthropicMessages));
+        let output_cfg = json!({"output_config": {"effort": "low"}});
+        assert!(reasoning_requested_for_entry(&output_cfg, LocalEntry::AnthropicMessages));
+
+        // Chat entry: reasoning_effort presence, "none" counts as disabled.
+        let chat = json!({"reasoning_effort": "high"});
+        assert!(reasoning_requested_for_entry(&chat, LocalEntry::OaiChat));
+        let chat_none = json!({"reasoning_effort": "none"});
+        assert!(!reasoning_requested_for_entry(&chat_none, LocalEntry::OaiChat));
+        let chat_empty = json!({});
+        assert!(!reasoning_requested_for_entry(&chat_empty, LocalEntry::OaiChat));
+
+        // Responses entry: reasoning.effort.
+        let responses = json!({"reasoning": {"effort": "medium", "summary": "auto"}});
+        assert!(reasoning_requested_for_entry(&responses, LocalEntry::OaiResponses));
+        let responses_none = json!({"reasoning": {"effort": "none"}});
+        assert!(!reasoning_requested_for_entry(&responses_none, LocalEntry::OaiResponses));
+        let responses_no_effort = json!({"reasoning": {"summary": "auto"}});
+        assert!(!reasoning_requested_for_entry(&responses_no_effort, LocalEntry::OaiResponses));
     }
 
     // -----------------------------------------------------------------------

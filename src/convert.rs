@@ -40,71 +40,27 @@ pub fn is_openai_o_series(model: &str) -> bool {
         && model.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
 }
 
-/// Detect models that support `reasoning_effort`.
+/// Whether an Anthropic request asks for reasoning: an explicit
+/// `output_config.effort`, or `thinking.type` of `enabled`/`adaptive`.
 ///
-/// In addition to the OpenAI o-series / GPT-5+ / Grok families, DeepSeek
-/// models expose a top-level `reasoning_effort` field whose legal values are
-/// `low` / `high` / `max` (clamped via [`clamp_reasoning_effort_for_deepseek`]).
-pub fn supports_reasoning_effort(model: &str) -> bool {
-    let normalized = model.to_lowercase();
-    is_openai_o_series(&normalized)
-        || normalized
-            .strip_prefix("gpt-")
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(|c| c.is_ascii_digit() && c >= '5')
-        || normalized == "grok-4.5"
-        || normalized.starts_with("grok-4.5-")
-        || normalized.starts_with("grok-build-")
-        || normalized.contains("deepseek")
-}
-
-/// Resolve the appropriate OpenAI `reasoning_effort` from an Anthropic request body.
-pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
-    // Priority 1: explicit output_config.effort
-    if let Some(effort) = body
-        .pointer("/output_config/effort")
-        .and_then(|v| v.as_str())
-    {
-        return match effort {
-            "low" => Some("low"),
-            "medium" => Some("medium"),
-            "high" => Some("high"),
-            "max" => Some("xhigh"),
-            _ => None,
-        };
+/// `thinking.type=disabled` (or absent thinking) returns false: some upstreams
+/// (DeepSeek) reject a request that combines disabled thinking with a
+/// `reasoning_effort` parameter (400), so no effort field may be emitted for
+/// them. See parent CHANGELOG:404.
+///
+/// The effort *value* itself is not decided here — it comes from the outbound
+/// reasoning policy (`[reasoning] effort`, see `forward.rs`), applied by
+/// `server.rs` after conversion via `apply_reasoning_policy`.
+pub fn thinking_requested(body: &Value) -> bool {
+    if body.pointer("/output_config/effort").is_some() {
+        return true;
     }
-
-    // Priority 2: thinking.type + budget_tokens fallback
-    let thinking = body.get("thinking")?;
-    match thinking.get("type").and_then(|t| t.as_str()) {
-        Some("adaptive") => Some("xhigh"),
-        Some("enabled") => {
-            let budget = thinking.get("budget_tokens").and_then(|b| b.as_u64());
-            match budget {
-                Some(b) if b < 4_000 => Some("low"),
-                Some(b) if b < 16_000 => Some("medium"),
-                Some(_) => Some("high"),
-                None => Some("high"),
-            }
-        }
-        // Explicitly suppress effort when thinking is disabled: some upstreams
-        // (DeepSeek) reject `thinking.type=disabled` combined with a
-        // `reasoning_effort` parameter (400). See parent CHANGELOG:404.
-        Some("disabled") => None,
-        _ => None,
-    }
-}
-
-/// Clamp a resolved OpenAI `reasoning_effort` value to the legal DeepSeek enum
-/// (`low` / `high` / `max`). Mirrors the parent `effort_value_mode: "deepseek"`
-/// mapping (transform_codex_chat.rs): `max`/`xhigh` → `max`, everything else
-/// (`low`/`medium`/`high`) → `high`, except `low` stays `low`.
-pub fn clamp_reasoning_effort_for_deepseek(effort: &str) -> &'static str {
-    match effort {
-        "max" | "xhigh" => "max",
-        "low" => "low",
-        _ => "high",
-    }
+    matches!(
+        body.get("thinking")
+            .and_then(|t| t.get("type"))
+            .and_then(|t| t.as_str()),
+        Some("enabled" | "adaptive")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -224,19 +180,10 @@ pub fn anthropic_to_openai_with_reasoning_content(
         result["stream"] = v.clone();
     }
 
-    // Map Anthropic thinking → OpenAI reasoning_effort. `model` here is the
-    // configured upstream model (server.rs overwrites body["model"] before
-    // conversion), so clamp to DeepSeek's legal enum when applicable.
-    if supports_reasoning_effort(model) {
-        if let Some(effort) = resolve_reasoning_effort(&body) {
-            let effort = if model.contains("deepseek") {
-                clamp_reasoning_effort_for_deepseek(effort)
-            } else {
-                effort
-            };
-            result["reasoning_effort"] = json!(effort);
-        }
-    }
+    // Anthropic thinking → OpenAI reasoning_effort: only the *presence* is
+    // decided here indirectly — the converted body carries no effort field, and
+    // server.rs stamps the configured value afterwards via
+    // apply_reasoning_policy when the client asked for reasoning.
 
     // Tools (filter BatchTool and SendMessage — internal Claude tools)
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
@@ -1999,29 +1946,41 @@ mod tests {
     }
 
     #[test]
-    fn supports_reasoning_effort_deepseek() {
-        assert!(supports_reasoning_effort("deepseek-v4-flash"));
-        assert!(supports_reasoning_effort("deepseek-v4-pro"));
+    fn thinking_requested_variants() {
+        let enabled = json!({"thinking": {"type": "enabled", "budget_tokens": 32000}});
+        assert!(thinking_requested(&enabled));
+        let adaptive = json!({"thinking": {"type": "adaptive"}});
+        assert!(thinking_requested(&adaptive));
+        let output_cfg = json!({"output_config": {"effort": "low"}});
+        assert!(thinking_requested(&output_cfg));
+
+        // Explicitly disabled / absent thinking must not request reasoning.
+        let disabled = json!({"thinking": {"type": "disabled"}});
+        assert!(!thinking_requested(&disabled));
+        let absent = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(!thinking_requested(&absent));
     }
 
     #[test]
-    fn resolve_reasoning_effort_disabled_is_none() {
-        let body = json!({
-            "thinking": {"type": "disabled"},
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        assert_eq!(resolve_reasoning_effort(&body), None);
-    }
-
-    #[test]
-    fn deepseek_effort_clamp() {
-        // adaptive thinking on deepseek → clamped to max (legal DeepSeek enum).
-        let body = json!({
-            "model": "deepseek-v4-flash",
-            "thinking": {"type": "adaptive"},
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let out = anthropic_to_openai_with_reasoning_content(body, true).unwrap();
-        assert_eq!(out["reasoning_effort"], "max");
+    fn converted_chat_body_never_carries_reasoning_effort() {
+        // The effort *value* is stamped by server.rs via apply_reasoning_policy,
+        // so the conversion itself emits no field — regardless of thinking mode
+        // or model name (the old per-model mapping is gone).
+        for thinking in [
+            json!({"type": "enabled", "budget_tokens": 32000}),
+            json!({"type": "adaptive"}),
+            json!({"type": "disabled"}),
+        ] {
+            let body = json!({
+                "model": "deepseek-v4-flash",
+                "thinking": thinking,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            let out = anthropic_to_openai_with_reasoning_content(body, true).unwrap();
+            assert!(
+                out.get("reasoning_effort").is_none(),
+                "thinking: {thinking}"
+            );
+        }
     }
 }

@@ -28,7 +28,11 @@ cargo run   # 或 ./run.sh
 
 ## 配置
 
-- 脚本自动从仓库根 `.env` 读取 `LISTEN_ADDR` / `LISTEN_PORT` / `UPSTREAM_AUTH_KEY`（缺失时兜底默认 `http://127.0.0.1:18650`）。
+- 脚本自动从 `~/.ai-bridge/<profile>.toml`（默认 `default.toml`）读取 `listen_addr` / `listen_port` / `auth_key`，缺失时兜底默认 `http://127.0.0.1:18650`。
+- 环境变量 `AI_BRIDGE_PROFILE` 指定 profile 名、`AI_BRIDGE_CONFIG` 直接指定配置文件路径：
+  ```bash
+  AI_BRIDGE_PROFILE=deepseek ./manual-test/test-chat.sh
+  ```
 - 设置环境变量 `AI_BRIDGE_URL` 可整体覆盖 Base URL，例如指向一个 mock 上游：
   ```bash
   AI_BRIDGE_URL=http://127.0.0.1:9999 ./manual-test/test-chat.sh
@@ -48,4 +52,4 @@ cargo run   # 或 ./run.sh
 
 - **流式**：`[RESP #xxxx]: ` 一行应出现，且响应文本**实时 append 到同一行**，完成后换行。
 - **错误**：应出现 `[ERR-REQ #xxxx]` / `[ERR-RESP #xxxx]` 标记行。
-- 覆盖三种 `UPSTREAM_TYPE`（`anthropic-messages` / `oai-chat` / `oai-responses`）各跑一遍三个脚本，可验证全部转换矩阵；特别是 `UPSTREAM_TYPE=anthropic-messages` 时三入口都应能在 `[RESP]` 行看到流式文本。
+- 覆盖三种 `upstream_type`（`anthropic-messages` / `oai-chat` / `oai-responses`）各写一份 profile 配置并分别启动，各跑一遍三个脚本，可验证全部转换矩阵；特别是 `upstream_type = "anthropic-messages"` 时三入口都应能在 `[RESP]` 行看到流式文本。

@@ -1,17 +1,17 @@
 //! Image description for text-only upstreams.
 //!
 //! When a local request carries images and the upstream model is confirmed
-//! text-only (e.g. DeepSeek), a separately configured vision model (`VISION_*`)
-//! describes the images and the description text replaces the image blocks
-//! before forwarding. This mirrors Plugin-Deepseek-Vision's approach, but with
-//! our own config surface instead of a plugin host.
+//! text-only (e.g. DeepSeek), a separately configured vision model (the
+//! `[vision]` table) describes the images and the description text replaces
+//! the image blocks before forwarding. This mirrors Plugin-Deepseek-Vision's
+//! approach, but with our own config surface instead of a plugin host.
 //!
 //! Behavior:
 //! - All images in one request are analyzed together in a single non-streaming
 //!   vision call (multi-image joint analysis).
-//! - Prompt selection: `VISION_PROMPT` (custom) wins, else `VISION_PROMPT_MODE`
+//! - Prompt selection: `prompt` (custom) wins, else `prompt_mode`
 //!   selects a built-in template (`auto` | `general` | `ui` | `compact`,
-//!   default `auto`); `VISION_MAX_TOKENS` caps the vision output.
+//!   default `auto`); `max_tokens` caps the vision output.
 //! - Each image is labeled by its true 1-based document index (`[Image N]`)
 //!   with an injected text part before its image block, so partial-cache calls
 //!   keep the correct mapping.
@@ -401,8 +401,8 @@ Every image below is preceded by a label such as [Image N]. For EACH image, outp
 4) if something cannot be made out, write "cannot make out" — do not fabricate.
 Use Markdown bullet points; the more information the better. When there are multiple images, also briefly note how they relate to one another."#;
 
-/// Choose the description prompt: custom (`VISION_PROMPT`) wins, else the
-/// mode template (`VISION_PROMPT_MODE`), else the auto-routing default.
+/// Choose the description prompt: custom (`prompt`) wins, else the
+/// mode template (`prompt_mode`), else the auto-routing default.
 fn select_prompt(vision: &VisionConfig) -> &str {
     if let Some(custom) = vision.custom_prompt.as_deref() {
         return custom;

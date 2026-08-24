@@ -8,10 +8,7 @@
 //! - system prompt uses `instructions` field instead of system role message
 //! - Usage field names match Anthropic (input_tokens/output_tokens)
 
-use crate::convert::{
-    clamp_reasoning_effort_for_deepseek, clean_schema, resolve_reasoning_effort,
-    strip_leading_anthropic_billing_header, supports_reasoning_effort,
-};
+use crate::convert::{clean_schema, strip_leading_anthropic_billing_header};
 use crate::error::Error;
 use crate::json_canonical::canonical_json_string;
 use crate::reasoning_bridge::{
@@ -317,21 +314,9 @@ pub fn anthropic_to_responses(body: Value) -> Result<Value, Error> {
         result["stream"] = v.clone();
     }
 
-    // Map Anthropic thinking → OpenAI Responses reasoning.effort. `model_name`
-    // here is the configured upstream model (server.rs overwrites body["model"]
-    // before conversion), so clamp to DeepSeek's legal enum when applicable.
-    if let Some(model_name) = body.get("model").and_then(|m| m.as_str()) {
-        if supports_reasoning_effort(model_name) {
-            if let Some(effort) = resolve_reasoning_effort(&body) {
-                let effort = if model_name.contains("deepseek") {
-                    clamp_reasoning_effort_for_deepseek(effort)
-                } else {
-                    effort
-                };
-                result["reasoning"] = json!({ "effort": effort });
-            }
-        }
-    }
+    // Anthropic thinking → OpenAI Responses reasoning.effort: the converted
+    // body carries no reasoning field — server.rs stamps the configured value
+    // afterwards via apply_reasoning_policy when the client asked for reasoning.
 
     // stop_sequences → dropped (Responses API doesn't support them)
 

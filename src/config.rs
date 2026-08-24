@@ -1,0 +1,789 @@
+use crate::error::Error;
+use crate::forward::{
+    header_overrides_from_pairs, vision_upstream_type_from_url, Config, UpstreamReasoningPolicy,
+    UpstreamType, VisionConfig,
+};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// Configuration lives in `~/.ai-bridge/<profile>.toml` (ADR-0005): one file
+/// per upstream configuration, selected by CLI argument (`ai-bridge <name>`
+/// → `<name>.toml`), defaulting to `default.toml`. The former `UPSTREAM_*` /
+/// `VISION_*` / `LISTEN_*` environment variables are gone; only `RUST_LOG`
+/// is still read from the environment (tracing convention).
+pub(crate) const CONFIG_DIR_NAME: &str = ".ai-bridge";
+pub(crate) const DEFAULT_PROFILE: &str = "default";
+
+const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1";
+const DEFAULT_LISTEN_PORT: u16 = 18650;
+
+/// Fully-commented starter template dropped as `~/.ai-bridge/default.toml`
+/// when a requested profile file does not exist. Every value line is
+/// commented so the next launch fails with a precise "missing field" error
+/// instead of silently serving placeholder values.
+const DEFAULT_TEMPLATE: &str = r#"# ai-bridge 配置档案（profile）——本文件由 ai-bridge 自动生成，填好必填项后即可启动。
+#
+# 用法：
+#   ai-bridge            加载 ~/.ai-bridge/default.toml（即本文件）
+#   ai-bridge <名字>      加载 ~/.ai-bridge/<名字>.toml
+#   ai-bridge --list     列出所有可用配置
+#
+# 一份文件 = 一个上游配置；可复制本文件为其他名字建立多套配置。
+# 所有行均为注释 —— 取消注释并填入真实值后才能启动。
+
+# ===================== 必填 =====================
+
+# 上游 API 格式，三选一：anthropic-messages | oai-chat | oai-responses
+# 由它显式决定认证头、格式转换与错误格式，不做 URL 猜测 (ADR-0002)。
+#upstream_type = "oai-chat"
+
+# 上游 API 地址（与 upstream_type 匹配的 endpoint）
+#url = "https://api.example.com/v1/chat/completions"
+
+# 上游 API 密钥（openai 系上游走 Authorization: Bearer；anthropic 上游走 x-api-key）
+#api_key = "sk-your-upstream-key"
+
+# ===================== 可选 =====================
+
+# 强制使用的模型名 —— 请求体里的 model 一律被覆盖为此值。默认: deepseek-v4-flash
+#model = "deepseek-v4-flash"
+
+# 监听地址。默认: 127.0.0.1（仅本机回环；需要局域网访问时改为 0.0.0.0）
+#listen_addr = "127.0.0.1"
+
+# 监听端口。默认: 18650
+#listen_port = 18650
+
+# 入站鉴权 token —— 本地客户端访问中转时需携带（x-api-key 或 Authorization: Bearer）。
+# 不设置 = 不鉴权。
+#auth_key = "local-token"
+
+# 第三方 vision 补充开关，默认 false：图片原样透传给上游，由上游自身 vision 处理。
+#vision_supplement = false
+
+# 额外的上游请求头，覆盖同名默认头。
+#[headers]
+#X-Tenant = "default"
+
+# 出站推理参数策略。
+#[reasoning]
+#thinking = true       # 总开关，默认 true；关闭时出站请求删除一切思考参数
+#effort = "max"        # 默认 max；off/drop/none/disable/disabled = 整个删除该字段
+
+# 视觉模型（可选）：把图片描述成文字后再转发给纯文本上游 (ADR-0004)。
+# url + api_key + model 三项齐全才启用；缺任一项则禁用并告警。
+#[vision]
+#url = "https://vl.example.com/v1/chat/completions"
+#api_key = "sk-your-vision-key"
+#model = "vl-model"
+#prompt_mode = "auto"   # auto | general | ui | compact；未知值回退 auto
+#prompt = ""            # 非空白时完全覆盖 prompt_mode 模板
+#max_tokens = 1024      # 描述输出的 token 上限；0 = 不发送该字段
+
+# 视觉请求的额外请求头，格式同 [headers]。
+#[vision.headers]
+"#;
+
+/// A profile resolved from disk: its name, the exact file it came from, and
+/// the parsed runtime [`Config`].
+pub(crate) struct LoadedProfile {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) config: Config,
+}
+
+/// Resolve `$HOME/.ai-bridge`, where all profile TOMLs live.
+pub(crate) fn home_config_dir() -> Result<PathBuf, Error> {
+    config_dir(std::env::var("HOME").ok().as_deref())
+}
+
+/// Injected variant of [`home_config_dir`] so tests never mutate `$HOME`.
+fn config_dir(home: Option<&str>) -> Result<PathBuf, Error> {
+    match home.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(home) => Ok(Path::new(home).join(CONFIG_DIR_NAME)),
+        None => Err(Error::Config(
+            "HOME environment variable is not set; cannot resolve ~/.ai-bridge".into(),
+        )),
+    }
+}
+
+/// Profile names become filenames under `$HOME/.ai-bridge`, so restrict them
+/// to `[A-Za-z0-9_-]` — this rejects `.`, `..`, path separators and whitespace
+/// outright, making directory escape via a crafted name impossible.
+pub(crate) fn validate_profile_name(name: &str) -> Result<(), Error> {
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "Invalid profile name \"{name}\": expected letters, digits, '_' or '-' \
+             (e.g. \"ai-bridge my-profile\")"
+        )))
+    }
+}
+
+pub(crate) fn profile_path(base_dir: &Path, profile: &str) -> PathBuf {
+    base_dir.join(format!("{profile}.toml"))
+}
+
+/// Load and parse `<base_dir>/<name>.toml`. A missing file surfaces a config
+/// error that lists available profiles (via `--list`) and — best effort —
+/// drops a commented starter template at `<base_dir>/default.toml`.
+pub(crate) fn load_profile(base_dir: &Path, name: &str) -> Result<LoadedProfile, Error> {
+    let path = profile_path(base_dir, name);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(missing_profile_error(base_dir, &path));
+        }
+        Err(e) => {
+            return Err(Error::Config(format!(
+                "Failed to read profile config {}: {e}",
+                path.display()
+            )));
+        }
+    };
+
+    let raw: RawProfile = toml::from_str(&text).map_err(|e| {
+        Error::Config(format!(
+            "Invalid profile config {}: {e}",
+            path.display()
+        ))
+    })?;
+    let config = build_config(raw)?;
+
+    Ok(LoadedProfile {
+        name: name.to_string(),
+        path,
+        config,
+    })
+}
+
+/// Build the not-found error, attempting to leave a starter template behind
+/// so first-time users have something concrete to edit. Template failures are
+/// warned about, never mask the original error.
+fn missing_profile_error(base_dir: &Path, path: &Path) -> Error {
+    let mut msg = format!(
+        "Profile config not found: {} (run 'ai-bridge --list' to see available profiles)",
+        path.display()
+    );
+    match write_default_template(base_dir) {
+        Ok(Some(template)) => msg.push_str(&format!(
+            "; a starter template was written to {}",
+            template.display()
+        )),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            "Could not write starter template to {}: {e}",
+            profile_path(base_dir, DEFAULT_PROFILE).display()
+        ),
+    }
+    Error::Config(msg)
+}
+
+/// Ensure the config directory exists and drop the commented `default.toml`
+/// template into it. Never overwrites an existing file. Returns the template
+/// path when a new file was written, `None` when one already existed.
+fn write_default_template(base_dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    std::fs::create_dir_all(base_dir)?;
+    let path = profile_path(base_dir, DEFAULT_PROFILE);
+    if path.exists() {
+        return Ok(None);
+    }
+    std::fs::write(&path, DEFAULT_TEMPLATE)?;
+    Ok(Some(path))
+}
+
+/// Sorted stems of the `*.toml` regular files in `base_dir`; an empty or
+/// missing directory yields an empty list (`--list` is never an error).
+pub(crate) fn list_profiles(base_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.strip_suffix(".toml").map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+// ---------------------------------------------------------------------------
+// Raw serde layer → runtime Config conversion
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProfile {
+    upstream_type: String,
+    url: String,
+    api_key: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    listen_addr: Option<String>,
+    #[serde(default)]
+    listen_port: Option<u16>,
+    #[serde(default)]
+    auth_key: Option<String>,
+    #[serde(default)]
+    vision_supplement: Option<bool>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    reasoning: Option<RawReasoning>,
+    #[serde(default)]
+    vision: Option<RawVision>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReasoning {
+    #[serde(default)]
+    thinking: Option<bool>,
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVision {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    prompt_mode: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+fn build_config(raw: RawProfile) -> Result<Config, Error> {
+    let upstream_type = UpstreamType::parse(&raw.upstream_type)?;
+
+    let override_headers = header_overrides_from_pairs("[headers]", raw.headers);
+
+    // Stringify back into the shared parser so accepted spellings (and the
+    // off/drop/none/... keyword set) have a single source of truth.
+    let thinking = raw
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.thinking)
+        .map(|b| b.to_string());
+    let effort = raw.reasoning.as_ref().and_then(|r| r.effort.clone());
+    let reasoning_policy = UpstreamReasoningPolicy::parse(thinking.as_deref(), effort.as_deref());
+
+    let vision = raw.vision.and_then(build_vision_config);
+
+    Ok(Config {
+        upstream_type,
+        url: raw.url,
+        api_key: raw.api_key,
+        model: raw.model.unwrap_or_else(|| DEFAULT_MODEL.into()),
+        listen_addr: raw.listen_addr.unwrap_or_else(|| DEFAULT_LISTEN_ADDR.into()),
+        listen_port: raw.listen_port.unwrap_or(DEFAULT_LISTEN_PORT),
+        // An explicitly empty string stays set (a required empty token),
+        // matching the documented caveat of the removed UPSTREAM_AUTH_KEY.
+        auth_key: raw.auth_key,
+        override_headers,
+        vision,
+        vision_supplement_enabled: raw.vision_supplement.unwrap_or(false),
+        reasoning_policy,
+    })
+}
+
+/// A config string value that counts as configured: present and non-blank
+/// after trimming.
+fn non_blank(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Vision is strictly additive: it needs `url` + `api_key` + `model`, all
+/// non-blank. Anything less logs which keys are missing and disables vision
+/// entirely (never falls back to the upstream). Blank strings count as absent
+/// so leftover `url = ""` lines cannot half-enable the feature.
+fn build_vision_config(raw: RawVision) -> Option<VisionConfig> {
+    let missing: Vec<&str> = [
+        ("url", non_blank(raw.url.as_deref()).is_none()),
+        ("api_key", non_blank(raw.api_key.as_deref()).is_none()),
+        ("model", non_blank(raw.model.as_deref()).is_none()),
+    ]
+    .iter()
+    .filter(|(_, absent)| *absent)
+    .map(|(key, _)| *key)
+    .collect();
+
+    let (Some(url), Some(api_key), Some(model)) = (
+        non_blank(raw.url.as_deref()),
+        non_blank(raw.api_key.as_deref()),
+        non_blank(raw.model.as_deref()),
+    ) else {
+        tracing::warn!(
+            "[vision] Incomplete [vision] table (missing or blank: {missing:?}); \
+             vision description disabled"
+        );
+        return None;
+    };
+
+    let override_headers =
+        header_overrides_from_pairs("[vision.headers]", raw.headers);
+
+    // Prompt mode: trim + lowercase; unknown → "auto" with a one-time startup
+    // warning. Vision tuning is optional, so a bad value never blocks startup.
+    let prompt_mode = raw.prompt_mode.unwrap_or_default();
+    let prompt_mode = prompt_mode.trim().to_ascii_lowercase();
+    let prompt_mode = match prompt_mode.as_str() {
+        "auto" | "general" | "ui" | "compact" => prompt_mode,
+        other => {
+            tracing::warn!(
+                "[vision] Unknown prompt_mode \"{other}\", falling back to \"auto\""
+            );
+            "auto".to_string()
+        }
+    };
+
+    // Custom prompt: present and non-blank wins over the mode template.
+    let custom_prompt = raw.prompt.filter(|p| !p.trim().is_empty());
+
+    // max_tokens == 0 omits the field, matching the reference script's
+    // "0 = omit" semantics for EXPLAIN_MAX_TOKENS.
+    let max_tokens = raw.max_tokens.filter(|n| *n != 0);
+
+    Some(VisionConfig {
+        url: url.to_string(),
+        api_key: api_key.to_string(),
+        model: model.to_string(),
+        upstream_type: vision_upstream_type_from_url(url),
+        override_headers,
+        prompt_mode,
+        custom_prompt,
+        max_tokens,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_vision_config, config_dir, list_profiles, load_profile, profile_path,
+        validate_profile_name, write_default_template, LoadedProfile, RawVision, DEFAULT_PROFILE,
+    };
+    use crate::forward::{ReasoningEffortOverride, UpstreamType};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    const MINIMAL_TOML: &str = r#"
+upstream_type = "oai-chat"
+url = "https://api.example.com/v1/chat/completions"
+api_key = "sk-test"
+"#;
+
+    fn write_profile(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = profile_path(dir, name);
+        fs::write(&path, content).expect("write profile");
+        path
+    }
+
+    fn load_minimal(dir: &Path) -> LoadedProfile {
+        load_profile(dir, "p").expect("minimal profile loads")
+    }
+
+    // -----------------------------------------------------------------------
+    // Parsing & defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn minimal_toml_uses_defaults() {
+        let dir = tempdir().unwrap();
+        write_profile(dir.path(), "p", MINIMAL_TOML);
+        let loaded = load_minimal(dir.path());
+        let cfg = &loaded.config;
+
+        assert_eq!(loaded.name, "p");
+        assert_eq!(loaded.path, profile_path(dir.path(), "p"));
+        assert_eq!(cfg.upstream_type, UpstreamType::OaiChat);
+        assert_eq!(cfg.url, "https://api.example.com/v1/chat/completions");
+        assert_eq!(cfg.api_key, "sk-test");
+        assert_eq!(cfg.model, "deepseek-v4-flash");
+        assert_eq!(cfg.listen_addr, "127.0.0.1");
+        assert_eq!(cfg.listen_port, 18650);
+        assert_eq!(cfg.auth_key, None);
+        assert!(!cfg.vision_supplement_enabled);
+        assert!(cfg.override_headers.is_empty());
+        assert!(cfg.vision.is_none());
+        assert!(cfg.reasoning_policy.thinking_enabled);
+        assert_eq!(
+            cfg.reasoning_policy.effort,
+            ReasoningEffortOverride::Set("max".into())
+        );
+    }
+
+    #[test]
+    fn full_toml_maps_every_field() {
+        let toml = r#"
+upstream_type = " Anthropic-Messages "
+url = "https://a.example/v1/messages"
+api_key = "ak"
+model = "m1"
+listen_addr = "0.0.0.0"
+listen_port = 8080
+auth_key = "tok"
+vision_supplement = true
+
+[headers]
+X-Tenant = "t1"
+X-Trace = "7"
+
+[reasoning]
+thinking = false
+effort = "XHigh"
+
+[vision]
+url = "https://v.example/v1/responses"
+api_key = "vk"
+model = "vm"
+prompt_mode = " UI "
+prompt = "custom prompt"
+max_tokens = 1024
+
+[vision.headers]
+X-V = "1"
+"#;
+        let dir = tempdir().unwrap();
+        write_profile(dir.path(), "p", toml);
+        let loaded = load_minimal(dir.path());
+        let cfg = &loaded.config;
+
+        assert_eq!(cfg.upstream_type, UpstreamType::AnthropicMessages);
+        assert_eq!(cfg.model, "m1");
+        assert_eq!(cfg.listen_addr, "0.0.0.0");
+        assert_eq!(cfg.listen_port, 8080);
+        assert_eq!(cfg.auth_key.as_deref(), Some("tok"));
+        assert!(cfg.vision_supplement_enabled);
+        assert_eq!(cfg.override_headers.len(), 2);
+        assert_eq!(cfg.override_headers.get("x-tenant").unwrap(), "t1");
+
+        assert!(!cfg.reasoning_policy.thinking_enabled);
+        assert_eq!(
+            cfg.reasoning_policy.effort,
+            ReasoningEffortOverride::Set("xhigh".into())
+        );
+
+        let vision = cfg.vision.as_ref().expect("vision enabled");
+        assert_eq!(vision.upstream_type, UpstreamType::OaiResponses);
+        assert_eq!(vision.prompt_mode, "ui");
+        assert_eq!(vision.custom_prompt.as_deref(), Some("custom prompt"));
+        assert_eq!(vision.max_tokens, Some(1024));
+        assert_eq!(vision.override_headers.get("x-v").unwrap(), "1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rejections
+    // -----------------------------------------------------------------------
+
+    fn load_err(dir: &Path, name: &str, content: &str) -> String {
+        write_profile(dir, name, content);
+        load_profile(dir, name).err().expect("should fail").to_string()
+    }
+
+    #[test]
+    fn unknown_key_is_rejected_with_name_and_path() {
+        let dir = tempdir().unwrap();
+        let err = load_err(
+            dir.path(),
+            "bad",
+            &format!("{MINIMAL_TOML}\nbogus_key = 1\n"),
+        );
+        assert!(err.contains("bogus_key"), "err: {err}");
+        assert!(err.contains(profile_path(dir.path(), "bad").to_str().unwrap()));
+        assert!(err.starts_with("配置错误"));
+    }
+
+    #[test]
+    fn wrong_type_is_rejected() {
+        let dir = tempdir().unwrap();
+        let err = load_err(dir.path(), "bad", &format!("{MINIMAL_TOML}\nlisten_port = \"x\"\n"));
+        assert!(err.contains("listen_port"), "err: {err}");
+    }
+
+    #[test]
+    fn out_of_range_port_is_rejected() {
+        let dir = tempdir().unwrap();
+        let err = load_err(dir.path(), "bad", &format!("{MINIMAL_TOML}\nlisten_port = 70000\n"));
+        assert!(err.contains("listen_port"), "err: {err}");
+    }
+
+    #[test]
+    fn missing_required_field_is_named() {
+        let dir = tempdir().unwrap();
+        let err = load_err(
+            dir.path(),
+            "bad",
+            "upstream_type = \"oai-chat\"\nurl = \"https://x\"\n",
+        );
+        assert!(err.contains("missing field") && err.contains("api_key"), "err: {err}");
+    }
+
+    #[test]
+    fn malformed_toml_is_rejected_with_path() {
+        let dir = tempdir().unwrap();
+        let err = load_err(dir.path(), "bad", "not [ valid");
+        assert!(err.contains("Invalid profile config"), "err: {err}");
+        assert!(err.contains(profile_path(dir.path(), "bad").to_str().unwrap()));
+    }
+
+    #[test]
+    fn invalid_upstream_type_is_rejected() {
+        let dir = tempdir().unwrap();
+        let err = load_err(
+            dir.path(),
+            "bad",
+            "upstream_type = \"bogus\"\nurl = \"https://x\"\napi_key = \"k\"\n",
+        );
+        assert!(err.contains("upstream_type"), "err: {err}");
+    }
+
+    #[test]
+    fn reading_a_directory_instead_of_file_errors() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(profile_path(dir.path(), "d")).unwrap();
+        let err = load_profile(dir.path(), "d").err().expect("should fail");
+        assert!(
+            err.to_string().contains("Failed to read profile config"),
+            "err: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Vision gating & tuning
+    // -----------------------------------------------------------------------
+
+    fn raw_vision(url: Option<&str>, api_key: Option<&str>, model: Option<&str>) -> RawVision {
+        // TOML has no null — absent keys must simply be omitted.
+        let mut text = String::new();
+        if let Some(u) = url {
+            text.push_str(&format!("url = \"{u}\"\n"));
+        }
+        if let Some(k) = api_key {
+            text.push_str(&format!("api_key = \"{k}\"\n"));
+        }
+        if let Some(m) = model {
+            text.push_str(&format!("model = \"{m}\"\n"));
+        }
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn vision_requires_all_three_non_blank_keys() {
+        assert!(build_vision_config(raw_vision(Some("https://v/x"), Some("k"), Some("m"))).is_some());
+        // Missing any one key disables the whole feature…
+        for (u, k, m) in [
+            (None, Some("k"), Some("m")),
+            (Some("https://v/x"), None, Some("m")),
+            (Some("https://v/x"), Some("k"), None),
+        ] {
+            assert!(
+                build_vision_config(raw_vision(u, k, m)).is_none(),
+                "u={u:?} k={k:?} m={m:?}"
+            );
+        }
+        // …and blank strings count as absent.
+        for (u, k, m) in [
+            (Some(""), Some("k"), Some("m")),
+            (Some("   "), Some("k"), Some("m")),
+            (Some("https://v/x"), Some(""), Some("m")),
+        ] {
+            assert!(
+                build_vision_config(raw_vision(u, k, m)).is_none(),
+                "u={u:?} k={k:?} m={m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vision_prompt_mode_normalization() {
+        let bogus: RawVision =
+            toml::from_str("url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\nprompt_mode=\"bogus\"\n")
+                .unwrap();
+        assert_eq!(build_vision_config(bogus).unwrap().prompt_mode, "auto");
+
+        let padded: RawVision =
+            toml::from_str("url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\nprompt_mode=\" UI \"\n")
+                .unwrap();
+        assert_eq!(build_vision_config(padded).unwrap().prompt_mode, "ui");
+
+        let blank: RawVision =
+            toml::from_str("url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\nprompt=\"   \"\n").unwrap();
+        assert_eq!(build_vision_config(blank).unwrap().custom_prompt, None);
+    }
+
+    #[test]
+    fn vision_max_tokens_zero_omits_field() {
+        let zero: RawVision =
+            toml::from_str("url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\nmax_tokens=0\n").unwrap();
+        assert_eq!(build_vision_config(zero).unwrap().max_tokens, None);
+
+        let some: RawVision =
+            toml::from_str("url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\nmax_tokens=512\n").unwrap();
+        assert_eq!(build_vision_config(some).unwrap().max_tokens, Some(512));
+
+        // Negative values are rejected by serde itself.
+        let negative = toml::from_str::<RawVision>(
+            "url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\nmax_tokens=-1\n",
+        );
+        assert!(negative.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Reasoning table
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reasoning_table_feeds_shared_parser() {
+        let dir = tempdir().unwrap();
+        let toml = format!(
+            "{MINIMAL_TOML}\n[reasoning]\nthinking = false\neffort = \"off\"\n"
+        );
+        write_profile(dir.path(), "r", &toml);
+        let loaded = load_profile(dir.path(), "r").expect("reasoning profile loads");
+        let policy = &loaded.config.reasoning_policy;
+        assert!(!policy.thinking_enabled);
+        assert_eq!(policy.effort, ReasoningEffortOverride::Drop);
+    }
+
+    #[test]
+    fn reasoning_effort_passes_custom_values_through() {
+        let dir = tempdir().unwrap();
+        let toml = format!("{MINIMAL_TOML}\n[reasoning]\neffort = \"XHigh\"\n");
+        write_profile(dir.path(), "r", &toml);
+        let loaded = load_profile(dir.path(), "r").expect("reasoning profile loads");
+        let policy = &loaded.config.reasoning_policy;
+        assert!(policy.thinking_enabled);
+        assert_eq!(
+            policy.effort,
+            ReasoningEffortOverride::Set("xhigh".into())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Paths & names
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn profile_name_validation_matrix() {
+        for ok in ["default", "my-profile", "A_z_9", "123"] {
+            assert!(validate_profile_name(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "", ".", "..", "a/b", "a\\b", "has space", "../escape", "中文", "a\tb", ".hidden",
+        ] {
+            assert!(validate_profile_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn config_dir_resolves_home_or_errors() {
+        assert_eq!(
+            config_dir(Some("/Users/x")).unwrap(),
+            Path::new("/Users/x").join(super::CONFIG_DIR_NAME)
+        );
+        assert!(config_dir(None).is_err());
+        assert!(config_dir(Some("")).is_err());
+        assert!(config_dir(Some("   ")).is_err());
+    }
+
+    #[test]
+    fn profile_path_appends_toml_suffix() {
+        assert_eq!(
+            profile_path(Path::new("/h/.ai-bridge"), "abc"),
+            Path::new("/h/.ai-bridge/abc.toml")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Missing-file fallback & starter template
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn missing_profile_reports_path_list_hint_and_writes_template() {
+        let dir = tempdir().unwrap();
+        let err = load_profile(dir.path(), "nosuch").err().expect("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("nosuch.toml"), "msg: {msg}");
+        assert!(msg.contains("--list"), "msg: {msg}");
+
+        let template = profile_path(dir.path(), DEFAULT_PROFILE);
+        assert!(template.is_file(), "starter template should exist");
+        assert!(
+            msg.contains("starter template was written to"),
+            "msg: {msg}"
+        );
+
+        // The template itself parses but names every required field.
+        let again = load_profile(dir.path(), DEFAULT_PROFILE)
+            .err()
+            .expect("commented template should still fail");
+        assert!(
+            again.to_string().contains("missing field"),
+            "again: {again}"
+        );
+    }
+
+    #[test]
+    fn existing_template_is_never_overwritten() {
+        let dir = tempdir().unwrap();
+        let template = profile_path(dir.path(), DEFAULT_PROFILE);
+        fs::write(&template, "upstream_type = \"sentinel\"\n").unwrap();
+
+        let err = load_profile(dir.path(), "other").err().expect("should fail");
+        assert!(
+            !err.to_string().contains("starter template"),
+            "existing template must not be reported as written: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&template).unwrap(),
+            "upstream_type = \"sentinel\"\n"
+        );
+    }
+
+    #[test]
+    fn write_default_template_creates_missing_directory() {
+        let nested = tempdir().unwrap().path().join("deep/new/dir");
+        let written = write_default_template(&nested).unwrap().expect("written");
+        assert_eq!(written, profile_path(&nested, DEFAULT_PROFILE));
+        assert!(nested.join(format!("{DEFAULT_PROFILE}.toml")).is_file());
+    }
+
+    // -----------------------------------------------------------------------
+    // --list scanning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_profiles_returns_sorted_stems_only() {
+        let dir = tempdir().unwrap();
+        assert!(list_profiles(dir.path()).is_empty());
+
+        write_profile(dir.path(), "zeta", "");
+        write_profile(dir.path(), "alpha", "");
+        fs::write(dir.path().join("notes.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("dir.toml")).unwrap(); // directories don't count
+
+        assert_eq!(list_profiles(dir.path()), vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn list_profiles_missing_directory_is_empty() {
+        assert!(list_profiles(Path::new("/nonexistent/ai-bridge-test")).is_empty());
+    }
+}

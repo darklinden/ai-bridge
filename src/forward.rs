@@ -2,7 +2,8 @@ use crate::error::Error;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
-/// The upstream API format, declared explicitly via `UPSTREAM_TYPE`.
+/// The upstream API format, declared explicitly via the `upstream_type`
+/// config key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpstreamType {
     AnthropicMessages,
@@ -11,39 +12,49 @@ pub(crate) enum UpstreamType {
 }
 
 impl UpstreamType {
-    pub(crate) fn from_env_var(name: &str) -> Result<Self, Error> {
+    pub(crate) fn parse(name: &str) -> Result<Self, Error> {
         match name.trim().to_ascii_lowercase().as_str() {
             "anthropic-messages" => Ok(UpstreamType::AnthropicMessages),
             "oai-chat" => Ok(UpstreamType::OaiChat),
             "oai-responses" => Ok(UpstreamType::OaiResponses),
             other => Err(Error::Config(format!(
-                "Invalid UPSTREAM_TYPE \"{other}\": expected one of \
+                "Invalid upstream_type \"{other}\": expected one of \
                  anthropic-messages | oai-chat | oai-responses"
             ))),
+        }
+    }
+
+    /// The canonical lowercase name, for startup banners and logs.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            UpstreamType::AnthropicMessages => "anthropic-messages",
+            UpstreamType::OaiChat => "oai-chat",
+            UpstreamType::OaiResponses => "oai-responses",
         }
     }
 }
 
 /// Config for a separately configured vision model used to describe images
-/// before forwarding to a text-only upstream (`VISION_*`).
+/// before forwarding to a text-only upstream (the optional `[vision]` table).
 #[derive(Debug, Clone)]
 pub(crate) struct VisionConfig {
     pub(crate) url: String,
     pub(crate) api_key: String,
     pub(crate) model: String,
     pub(crate) upstream_type: UpstreamType,
-    /// Headers from `VISION_HEADERS` overridden on every vision request.
+    /// Headers from `[vision.headers]` overridden on every vision request.
     pub(crate) override_headers: HeaderMap,
     /// Prompt template mode: "auto" (default) | "general" | "ui" | "compact".
     /// Normalized at parse time; unknown values fall back to "auto".
     pub(crate) prompt_mode: String,
-    /// Custom description prompt from `VISION_PROMPT`; overrides `prompt_mode`.
+    /// Custom description prompt from the `prompt` key; overrides `prompt_mode`.
     pub(crate) custom_prompt: Option<String>,
-    /// Output token cap from `VISION_MAX_TOKENS`; None = omit. 0/empty/invalid → None.
+    /// Output token cap from the `max_tokens` key; None = omit. 0 → None.
     pub(crate) max_tokens: Option<u32>,
 }
 
 /// Configuration for forwarding requests to the configured upstream API.
+/// Parsed once at startup from a TOML profile file by [`crate::config`].
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) upstream_type: UpstreamType,
@@ -53,211 +64,64 @@ pub(crate) struct Config {
     pub(crate) listen_addr: String,
     pub(crate) listen_port: u16,
     pub(crate) auth_key: Option<String>,
-    /// Headers from `UPSTREAM_HEADERS` overridden on every upstream request.
+    /// Headers from the `[headers]` table overridden on every upstream request.
     pub(crate) override_headers: HeaderMap,
     /// Optional separately configured vision model for image description.
     pub(crate) vision: Option<VisionConfig>,
-    /// Whether the third-party vision supplement is enabled
-    /// (`THIRDPARTY_VISION_SUPPLEMENT`, default off). When off, images pass
-    /// through to the upstream untouched so the upstream's own vision handles
-    /// them; when on, text-only upstreams get the VISION_* describe/strip path.
+    /// Whether the third-party vision supplement is enabled (the
+    /// `vision_supplement` key, default off). When off, images pass through to
+    /// the upstream untouched so the upstream's own vision handles them; when
+    /// on, text-only upstreams get the `[vision]` describe/strip path.
     pub(crate) vision_supplement_enabled: bool,
+    /// Outbound reasoning policy (the `[reasoning]` table), applied to every
+    /// forwarded request via [`apply_reasoning_policy`].
+    pub(crate) reasoning_policy: UpstreamReasoningPolicy,
 }
 
-impl Config {
-    /// Read configuration from environment variables.
-    ///
-    /// Required: `UPSTREAM_TYPE`, `UPSTREAM_URL`, `UPSTREAM_API_KEY`
-    /// Optional: `UPSTREAM_MODEL` (default: `deepseek-v4-flash`),
-    ///           `LISTEN_ADDR` (default: `0.0.0.0`),
-    ///           `LISTEN_PORT` (default: `18650`),
-    ///           `UPSTREAM_AUTH_KEY`, `UPSTREAM_HEADERS`,
-    ///           `THIRDPARTY_VISION_SUPPLEMENT`,
-    ///           `VISION_URL` / `VISION_API_KEY` / `VISION_MODEL` / `VISION_HEADERS`
-    pub fn from_env() -> Result<Self, Error> {
-        reject_legacy_env()?;
-
-        let upstream_type = UpstreamType::from_env_var(
-            &std::env::var("UPSTREAM_TYPE").map_err(|_| {
-                Error::Config("Missing UPSTREAM_TYPE environment variable".into())
-            })?,
-        )?;
-        let url = std::env::var("UPSTREAM_URL")
-            .map_err(|_| Error::Config("Missing UPSTREAM_URL environment variable".into()))?;
-        let api_key = std::env::var("UPSTREAM_API_KEY")
-            .map_err(|_| Error::Config("Missing UPSTREAM_API_KEY environment variable".into()))?;
-        let model = std::env::var("UPSTREAM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into());
-        let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0".into());
-        let listen_port = std::env::var("LISTEN_PORT")
-            .unwrap_or_else(|_| "18650".into())
-            .parse::<u16>()?;
-        let auth_key = std::env::var("UPSTREAM_AUTH_KEY").ok();
-        let override_headers =
-            parse_header_overrides(&std::env::var("UPSTREAM_HEADERS").unwrap_or_default());
-
-        for (name, value) in &override_headers {
-            tracing::debug!(
-                "Header override: {}={}",
-                name,
-                value.to_str().unwrap_or("<non-ascii>")
-            );
-        }
-
-        let vision = parse_vision_config()?;
-        let vision_supplement_enabled = parse_bool(
-            std::env::var("THIRDPARTY_VISION_SUPPLEMENT").ok().as_deref(),
-            false,
-        );
-
-        Ok(Self {
-            upstream_type,
-            url,
-            api_key,
-            model,
-            listen_addr,
-            listen_port,
-            auth_key,
-            override_headers,
-            vision,
-            vision_supplement_enabled,
-        })
-    }
-}
-
-/// Reject any legacy `OPENAI_COMP_*` variable with a clear migration error.
-/// The naming migration is intentionally non-compatible (ADR-0003).
-fn reject_legacy_env() -> Result<(), Error> {
-    for legacy in [
-        "OPENAI_COMP_URL",
-        "OPENAI_COMP_API_KEY",
-        "OPENAI_COMP_MODEL",
-        "OPENAI_COMP_AUTH_KEY",
-        "OPENAI_COMP_HEADERS",
-    ] {
-        if std::env::var_os(legacy).is_some() {
-            return Err(Error::Config(format!(
-                "Legacy environment variable {legacy} is no longer supported. \
-                 Rename to the corresponding UPSTREAM_* variable (see AGENTS.md / ADR-0003)."
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Parse the optional `VISION_*` config. Returns `None` when any required piece
-/// is absent — vision is strictly additive and never falls back to the upstream.
-fn parse_vision_config() -> Result<Option<VisionConfig>, Error> {
-    parse_vision_config_with(|name| std::env::var(name).ok())
-}
-
-/// Pure variant of [`parse_vision_config`] taking a name→value lookup so tests
-/// can exercise parsing without mutating process env (which would race under
-/// parallel `cargo test`).
-fn parse_vision_config_with(
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<Option<VisionConfig>, Error> {
-    let url = env("VISION_URL");
-    let api_key = env("VISION_API_KEY");
-    let model = env("VISION_MODEL");
-
-    let Some(url) = url else {
-        return Ok(None);
-    };
-    let Some(api_key) = api_key else {
-        return Ok(None);
-    };
-    let Some(model) = model else {
-        return Ok(None);
-    };
-
-    let upstream_type = if url.contains("/responses") {
+/// Infer the wire format of a `[vision]` endpoint from its URL:
+/// contains `/responses` → OaiResponses; contains `/messages` but not
+/// `/chat/completions` → AnthropicMessages; otherwise OaiChat. Vision
+/// endpoints are OpenAI Chat or Anthropic Messages; anthropic URLs end in
+/// /v1/messages which contains neither chat nor responses. This is the one
+/// deliberate heuristic in the codebase — the main upstream type stays
+/// explicit (ADR-0002).
+pub(crate) fn vision_upstream_type_from_url(url: &str) -> UpstreamType {
+    if url.contains("/responses") {
         UpstreamType::OaiResponses
+    } else if url.contains("/messages") && !url.contains("/chat/completions") {
+        UpstreamType::AnthropicMessages
     } else {
-        // Vision endpoints are OpenAI Chat or Anthropic Messages; anthropic URLs
-        // end in /v1/messages which contains neither chat nor responses.
-        if url.contains("/messages") && !url.contains("/chat/completions") {
-            UpstreamType::AnthropicMessages
-        } else {
-            UpstreamType::OaiChat
-        }
-    };
-
-    let override_headers =
-        parse_header_overrides(&env("VISION_HEADERS").unwrap_or_default());
-
-    // Prompt mode: trim + lowercase; unknown → "auto" with a one-time startup
-    // warning. Vision tuning is optional, so a bad value never blocks startup.
-    let prompt_mode = env("VISION_PROMPT_MODE").unwrap_or_default();
-    let prompt_mode = prompt_mode.trim().to_ascii_lowercase();
-    let prompt_mode = match prompt_mode.as_str() {
-        "auto" | "general" | "ui" | "compact" => prompt_mode,
-        other => {
-            tracing::warn!(
-                "[VISION_PROMPT_MODE] Unknown mode \"{other}\", falling back to \"auto\""
-            );
-            "auto".to_string()
-        }
-    };
-
-    // Custom prompt: present and non-blank wins over the mode template.
-    let custom_prompt = env("VISION_PROMPT").filter(|p| !p.trim().is_empty());
-
-    // Max tokens: empty/0/invalid → None (omit), matching the reference
-    // script's "0 = omit" semantics for EXPLAIN_MAX_TOKENS.
-    let max_tokens = match env("VISION_MAX_TOKENS") {
-        Some(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u32>() {
-            Ok(0) => None,
-            Ok(n) => Some(n),
-            Err(_) => {
-                tracing::warn!(
-                    "[VISION_MAX_TOKENS] Invalid value \"{raw}\", omitting max_tokens"
-                );
-                None
-            }
-        },
-        _ => None,
-    };
-
-    Ok(Some(VisionConfig {
-        url,
-        api_key,
-        model,
-        upstream_type,
-        override_headers,
-        prompt_mode,
-        custom_prompt,
-        max_tokens,
-    }))
+        UpstreamType::OaiChat
+    }
 }
 
-/// Parse `OPENAI_COMP_HEADERS` (`A:a|B:b`) into a validated header map.
-///
-/// Pairs are `|`-separated; each value is split on the first `:` so values may
-/// contain `:` (but not `|`). Names and values are trimmed. Entries with empty
-/// names or empty/invalid header values are skipped with a WARN (mirrors
-/// cc-switch's `apply_local_proxy_header_overrides`). Duplicate names: last wins.
-fn parse_header_overrides(raw: &str) -> HeaderMap {
+/// Build a validated header map from `(name, value)` pairs sourced from a TOML
+/// table (`[headers]` / `[vision.headers]`). Names and values are trimmed.
+/// Entries with empty names or empty/invalid header values are skipped with a
+/// WARN labeled by `label` (mirrors cc-switch's
+/// `apply_local_proxy_header_overrides`). Later pairs win over earlier ones.
+pub(crate) fn header_overrides_from_pairs(
+    label: &str,
+    entries: impl IntoIterator<Item = (String, String)>,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    for pair in raw.split('|') {
-        let Some((raw_name, raw_value)) = pair.split_once(':') else {
-            continue;
-        };
+    for (raw_name, raw_value) in entries {
         let name = raw_name.trim();
         let value = raw_value.trim();
         if name.is_empty() {
-            tracing::warn!("[OPENAI_COMP_HEADERS] Ignoring entry with empty header name");
+            tracing::warn!("[{label}] Ignoring entry with empty header name");
             continue;
         }
         if value.is_empty() {
-            tracing::warn!("[OPENAI_COMP_HEADERS] Ignoring entry with empty value for {name}");
+            tracing::warn!("[{label}] Ignoring entry with empty value for {name}");
             continue;
         }
         let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
-            tracing::warn!("[OPENAI_COMP_HEADERS] Ignoring invalid header name: {raw_name}");
+            tracing::warn!("[{label}] Ignoring invalid header name: {raw_name}");
             continue;
         };
         let Ok(value) = HeaderValue::from_str(value) else {
-            tracing::warn!("[OPENAI_COMP_HEADERS] Ignoring invalid header value for {name}");
+            tracing::warn!("[{label}] Ignoring invalid header value for {name}");
             continue;
         };
         headers.insert(name, value);
@@ -275,6 +139,140 @@ fn parse_bool(raw: Option<&str>, default: bool) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Outbound reasoning policy (`[reasoning]` table: thinking / effort)
+// ---------------------------------------------------------------------------
+
+/// What to do with the outgoing reasoning-effort field (`reasoning_effort` on
+/// Chat Completions, `reasoning.effort` on Responses), resolved once at startup
+/// from the `[reasoning]` config table. The configured value is the single
+/// source of truth — no per-model mapping is applied on top of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReasoningEffortOverride {
+    /// Stamp this exact value onto outgoing requests (lowercased).
+    Set(String),
+    /// Remove the field from outgoing requests entirely (for upstreams that
+    /// reject the parameter altogether).
+    Drop,
+}
+
+impl ReasoningEffortOverride {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            ReasoningEffortOverride::Set(v) => v.clone(),
+            ReasoningEffortOverride::Drop => "drop".into(),
+        }
+    }
+}
+
+/// Outbound reasoning policy applied to every forwarded request:
+/// - `thinking_enabled == false` (master switch off): all thinking affordances
+///   are stripped from outgoing requests and `effort` is ignored.
+/// - otherwise the effort override decides the outgoing effort value, but only
+///   for requests whose client actually asked for reasoning (an explicitly
+///   disabled request never gains an effort field — some upstreams reject that
+///   combination).
+#[derive(Debug, Clone)]
+pub(crate) struct UpstreamReasoningPolicy {
+    /// Master switch from `[reasoning] thinking` (default on).
+    pub(crate) thinking_enabled: bool,
+    /// Effort value policy from `[reasoning] effort` (default `max`).
+    pub(crate) effort: ReasoningEffortOverride,
+}
+
+impl UpstreamReasoningPolicy {
+    /// Resolve the policy from raw string values so callers with typed config
+    /// (e.g. TOML bools) stringify into the same accepted spellings, keeping a
+    /// single source of truth. Used by tests without process-env mutation.
+    pub(crate) fn parse(thinking: Option<&str>, effort: Option<&str>) -> Self {
+        let thinking_enabled = parse_bool(thinking, true);
+        let effort = match effort.map(str::trim).filter(|v| !v.is_empty()) {
+            None => ReasoningEffortOverride::Set("max".into()),
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "off" | "drop" | "none" | "disable" | "disabled" => {
+                    ReasoningEffortOverride::Drop
+                }
+                _ => ReasoningEffortOverride::Set(raw.to_ascii_lowercase()),
+            },
+        };
+        Self {
+            thinking_enabled,
+            effort,
+        }
+    }
+}
+
+/// Apply the outbound reasoning policy to a request body about to be forwarded.
+///
+/// `client_wants_reasoning`: whether the original local-entry request asked for
+/// reasoning at all (any effort/thinking signal other than an explicit disable).
+/// Only then is a `Set` effort stamped; explicit disables stay effort-free.
+///
+/// Wire formats:
+/// - OaiChat: top-level `reasoning_effort`
+/// - OaiResponses: `reasoning.effort` (other `reasoning` keys such as `summary`
+///   are preserved; the object is pruned when it becomes empty)
+/// - AnthropicMessages: no effort concept — only the master switch acts, by
+///   removing the top-level `thinking` field.
+pub(crate) fn apply_reasoning_policy(
+    body: &mut Value,
+    upstream_type: UpstreamType,
+    policy: &UpstreamReasoningPolicy,
+    client_wants_reasoning: bool,
+) {
+    match upstream_type {
+        UpstreamType::AnthropicMessages => {
+            if !policy.thinking_enabled && remove_json_key(body, "thinking") {
+                tracing::debug!("reasoning policy: removed thinking ([reasoning] thinking off)");
+            }
+        }
+        UpstreamType::OaiChat => {
+            if !policy.thinking_enabled || policy.effort == ReasoningEffortOverride::Drop {
+                if remove_json_key(body, "reasoning_effort") {
+                    tracing::debug!("reasoning policy: removed reasoning_effort");
+                }
+            } else if client_wants_reasoning {
+                let ReasoningEffortOverride::Set(value) = &policy.effort else {
+                    return;
+                };
+                body["reasoning_effort"] = json!(value);
+                tracing::debug!("reasoning policy: reasoning_effort → {value}");
+            }
+        }
+        UpstreamType::OaiResponses => {
+            if !policy.thinking_enabled || policy.effort == ReasoningEffortOverride::Drop {
+                let removed = body
+                    .get_mut("reasoning")
+                    .and_then(Value::as_object_mut)
+                    .is_some_and(|obj| obj.remove("effort").is_some());
+                // Prune the now-empty `reasoning` object.
+                if body.get("reasoning").and_then(Value::as_object) == Some(&serde_json::Map::new())
+                {
+                    remove_json_key(body, "reasoning");
+                }
+                if removed {
+                    tracing::debug!("reasoning policy: removed reasoning.effort");
+                }
+            } else if client_wants_reasoning {
+                let ReasoningEffortOverride::Set(value) = &policy.effort else {
+                    return;
+                };
+                if body.get("reasoning").map(|r| !r.is_object()).unwrap_or(true) {
+                    body["reasoning"] = json!({});
+                }
+                body["reasoning"]["effort"] = json!(value);
+                tracing::debug!("reasoning policy: reasoning.effort → {value}");
+            }
+        }
+    }
+}
+
+/// Remove `key` from an object body; returns whether anything was removed.
+fn remove_json_key(body: &mut Value, key: &str) -> bool {
+    body.as_object_mut()
+        .is_some_and(|obj| obj.remove(key).is_some())
+}
+
 /// Shared application state holding configuration and an HTTP client with connection pooling.
 pub(crate) struct AppState {
     pub(crate) config: Config,
@@ -282,12 +280,11 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    /// Create state from environment variables.
+    /// Create state from an already-parsed [`Config`].
     ///
     /// Builds a single `reqwest::Client` with connection pooling and a 5-minute
     /// upstream timeout, shared by all requests.
-    pub(crate) fn from_env() -> Result<Self, Error> {
-        let config = Config::from_env()?;
+    pub(crate) fn new(config: Config) -> Result<Self, Error> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .pool_max_idle_per_host(32)
@@ -537,10 +534,10 @@ pub(crate) async fn forward_to_responses_streaming(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_bool, parse_error_payload, parse_header_overrides, parse_vision_config_with,
-        UpstreamType,
+        apply_reasoning_policy, header_overrides_from_pairs, parse_bool, parse_error_payload,
+        ReasoningEffortOverride, UpstreamReasoningPolicy, UpstreamType,
     };
-    use std::collections::HashMap;
+    use serde_json::json;
 
     #[test]
     fn parse_bool_maps_truthy_values() {
@@ -566,18 +563,153 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Outbound reasoning policy ([reasoning] thinking / [reasoning] effort)
+    // -----------------------------------------------------------------------
+
+    fn policy(thinking: Option<&str>, effort: Option<&str>) -> UpstreamReasoningPolicy {
+        UpstreamReasoningPolicy::parse(thinking, effort)
+    }
+
+    #[test]
+    fn reasoning_policy_defaults_to_thinking_on_and_max_effort() {
+        let p = policy(None, None);
+        assert!(p.thinking_enabled);
+        assert_eq!(p.effort, ReasoningEffortOverride::Set("max".into()));
+
+        // Empty strings behave like missing values.
+        let p = policy(Some(""), Some("   "));
+        assert!(p.thinking_enabled);
+        assert_eq!(p.effort, ReasoningEffortOverride::Set("max".into()));
+    }
+
+    #[test]
+    fn reasoning_policy_parses_explicit_values() {
+        // Master switch off.
+        assert!(!policy(Some("0"), None).thinking_enabled);
+        assert!(!policy(Some("off"), None).thinking_enabled);
+        assert!(policy(Some("1"), None).thinking_enabled);
+        assert!(policy(Some("yes"), None).thinking_enabled);
+
+        // Effort values are lowercased verbatim — no whitelist, upstreams vary.
+        assert_eq!(
+            policy(None, Some("XHigh")).effort,
+            ReasoningEffortOverride::Set("xhigh".into())
+        );
+        assert_eq!(
+            policy(None, Some("  Medium ")).effort,
+            ReasoningEffortOverride::Set("medium".into())
+        );
+
+        // Reserved words drop the field entirely.
+        for raw in ["off", "drop", "none", "disable", "disabled", "DROP"] {
+            assert_eq!(
+                policy(None, Some(raw)).effort,
+                ReasoningEffortOverride::Drop,
+                "raw: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_policy_chat_stamps_overwrites_and_drops() {
+        let on_max = policy(None, None);
+
+        // Client asked for reasoning → effort stamped with the configured value.
+        let mut body = json!({"model": "m", "messages": []});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &on_max, true);
+        assert_eq!(body["reasoning_effort"], "max");
+
+        // Explicit value wins over whatever the client sent.
+        let mut body = json!({"reasoning_effort": "high"});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(None, Some("xhigh")), true);
+        assert_eq!(body["reasoning_effort"], "xhigh");
+
+        // Drop removes an existing field…
+        let mut body = json!({"reasoning_effort": "high"});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(None, Some("off")), true);
+        assert!(body.get("reasoning_effort").is_none());
+
+        // …and master-off removes it even with a Set configured.
+        let mut body = json!({"reasoning_effort": "high"});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(Some("0"), None), true);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn apply_policy_chat_never_injects_without_client_request() {
+        // No client reasoning signal → no field injected, even at default max.
+        // (A thinking-disabled request reaches this stamp with wants=false too,
+        // preserving the DeepSeek "disabled + reasoning_effort" 400 avoidance.)
+        let mut body = json!({"model": "m", "messages": []});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(None, None), false);
+        assert!(body.get("reasoning_effort").is_none());
+
+        // Master off wins over everything: even a requesting client gets stripped.
+        let mut body = json!({"reasoning_effort": "high"});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(Some("0"), None), true);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn apply_policy_responses_preserves_other_reasoning_keys() {
+        // Set: effort stamped inside the existing object; summary preserved.
+        let mut body = json!({"reasoning": {"effort": "high", "summary": "auto"}});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiResponses, &policy(None, Some("low")), true);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+
+        // Set: missing reasoning object is created.
+        let mut body = json!({});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiResponses, &policy(None, None), true);
+        assert_eq!(body["reasoning"]["effort"], "max");
+
+        // Drop: effort removed, sibling keys survive.
+        let mut body = json!({"reasoning": {"effort": "high", "summary": "auto"}});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiResponses, &policy(None, Some("off")), true);
+        assert!(body["reasoning"].get("effort").is_none());
+        assert_eq!(body["reasoning"]["summary"], "auto");
+
+        // Drop: empty reasoning object is pruned altogether.
+        let mut body = json!({"reasoning": {"effort": "high"}});
+        apply_reasoning_policy(&mut body, UpstreamType::OaiResponses, &policy(None, Some("off")), true);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn apply_policy_anthropic_only_acts_when_master_off() {
+        // Master on: untouched (no effort concept on this wire format).
+        let mut body = json!({"thinking": {"type": "enabled"}, "messages": []});
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::AnthropicMessages,
+            &policy(None, None),
+            true,
+        );
+        assert!(body.get("thinking").is_some());
+
+        // Master off: thinking stripped.
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::AnthropicMessages,
+            &policy(Some("false"), None),
+            true,
+        );
+        assert!(body.get("thinking").is_none());
+    }
+
     #[test]
     fn upstream_type_accepts_all_three_values() {
         assert_eq!(
-            UpstreamType::from_env_var("anthropic-messages").unwrap(),
+            UpstreamType::parse("anthropic-messages").unwrap(),
             UpstreamType::AnthropicMessages
         );
         assert_eq!(
-            UpstreamType::from_env_var("oai-chat").unwrap(),
+            UpstreamType::parse("oai-chat").unwrap(),
             UpstreamType::OaiChat
         );
         assert_eq!(
-            UpstreamType::from_env_var("oai-responses").unwrap(),
+            UpstreamType::parse("oai-responses").unwrap(),
             UpstreamType::OaiResponses
         );
     }
@@ -585,39 +717,65 @@ mod tests {
     #[test]
     fn upstream_type_is_case_insensitive() {
         assert_eq!(
-            UpstreamType::from_env_var("OAI-CHAT").unwrap(),
+            UpstreamType::parse("OAI-CHAT").unwrap(),
             UpstreamType::OaiChat
         );
         assert_eq!(
-            UpstreamType::from_env_var("  Anthropic-Messages  ").unwrap(),
+            UpstreamType::parse("  Anthropic-Messages  ").unwrap(),
             UpstreamType::AnthropicMessages
         );
     }
 
     #[test]
     fn upstream_type_rejects_unknown_values() {
-        assert!(UpstreamType::from_env_var("bogus").is_err());
-        assert!(UpstreamType::from_env_var("").is_err());
-        assert!(UpstreamType::from_env_var("responses").is_err());
+        assert!(UpstreamType::parse("bogus").is_err());
+        assert!(UpstreamType::parse("").is_err());
+        assert!(UpstreamType::parse("responses").is_err());
     }
 
     #[test]
-    fn parses_simple_pairs() {
-        let headers = parse_header_overrides("A:a|B:b");
+    fn vision_upstream_type_inferred_from_url_markers() {
+        use super::vision_upstream_type_from_url;
+        assert_eq!(
+            vision_upstream_type_from_url("https://v.example/v1/responses"),
+            UpstreamType::OaiResponses
+        );
+        assert_eq!(
+            vision_upstream_type_from_url("https://v.example/v1/messages"),
+            UpstreamType::AnthropicMessages
+        );
+        // /chat/completions contains neither marker → chat; it also contains
+        // no "/messages", but guard against a URL carrying both markers.
+        assert_eq!(
+            vision_upstream_type_from_url("https://v.example/v1/chat/completions"),
+            UpstreamType::OaiChat
+        );
+        assert_eq!(
+            vision_upstream_type_from_url("https://messages.example/v1/chat/completions"),
+            UpstreamType::OaiChat
+        );
+    }
+
+    fn overrides(entries: &[(&str, &str)]) -> http::HeaderMap {
+        header_overrides_from_pairs(
+            "[headers]",
+            entries
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string())),
+        )
+    }
+
+    #[test]
+    fn builds_simple_pairs() {
+        let headers = overrides(&[("A", "a"), ("B", "b")]);
         assert_eq!(headers.len(), 2);
         assert_eq!(headers.get("a").unwrap(), "a");
         assert_eq!(headers.get("B").unwrap(), "b");
     }
 
     #[test]
-    fn value_may_contain_colons() {
-        let headers = parse_header_overrides("Cookie:x=y:z");
-        assert_eq!(headers.get("cookie").unwrap(), "x=y:z");
-    }
-
-    #[test]
     fn trims_whitespace_around_names_and_values() {
-        let headers = parse_header_overrides(" X-Trace : 123 | Y : 2 ");
+        let headers = overrides(&[(" X-Trace ", "123"), ("Y", " 2 ")]);
         assert_eq!(headers.len(), 2);
         assert_eq!(headers.get("x-trace").unwrap(), "123");
         assert_eq!(headers.get("y").unwrap(), "2");
@@ -625,132 +783,27 @@ mod tests {
 
     #[test]
     fn empty_input_yields_empty_map() {
-        let headers = parse_header_overrides("");
-        assert!(headers.is_empty());
+        assert!(overrides(&[]).is_empty());
     }
 
     #[test]
     fn skips_invalid_entries_but_keeps_valid_siblings() {
-        let headers = parse_header_overrides("bad name:x|X-Trace:1");
+        let headers = overrides(&[("bad name", "x"), ("X-Trace", "1")]);
         assert_eq!(headers.len(), 1);
         assert_eq!(headers.get("x-trace").unwrap(), "1");
     }
 
     #[test]
     fn skips_empty_value() {
-        let headers = parse_header_overrides("A:");
+        let headers = overrides(&[("A", "")]);
         assert!(headers.is_empty());
     }
 
     #[test]
     fn duplicate_names_last_wins() {
-        let headers = parse_header_overrides("X:1|X:2");
+        let headers = overrides(&[("X", "1"), ("X", "2")]);
         assert_eq!(headers.len(), 1);
         assert_eq!(headers.get("x").unwrap(), "2");
-    }
-
-    fn env_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
-        entries
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    fn parse_with(map: &HashMap<String, String>) -> Option<super::VisionConfig> {
-        parse_vision_config_with(|name| map.get(name).cloned())
-            .expect("parse_vision_config_with should not error")
-    }
-
-    #[test]
-    fn parse_vision_config_parses_full_config() {
-        let map = env_map(&[
-            ("VISION_URL", "http://vision/v1/chat/completions"),
-            ("VISION_API_KEY", "k"),
-            ("VISION_MODEL", "m"),
-            ("VISION_PROMPT_MODE", "compact"),
-            ("VISION_PROMPT", "custom"),
-            ("VISION_MAX_TOKENS", "2048"),
-        ]);
-        let cfg = parse_with(&map).expect("full config parses");
-        assert_eq!(cfg.prompt_mode, "compact");
-        assert_eq!(cfg.custom_prompt.as_deref(), Some("custom"));
-        assert_eq!(cfg.max_tokens, Some(2048));
-    }
-
-    #[test]
-    fn parse_vision_config_defaults_prompt_mode_to_auto() {
-        let map = env_map(&[
-            ("VISION_URL", "http://vision/v1/chat/completions"),
-            ("VISION_API_KEY", "k"),
-            ("VISION_MODEL", "m"),
-        ]);
-        let cfg = parse_with(&map).unwrap();
-        assert_eq!(cfg.prompt_mode, "auto");
-        assert_eq!(cfg.custom_prompt, None);
-        assert_eq!(cfg.max_tokens, None);
-    }
-
-    #[test]
-    fn parse_vision_config_unknown_prompt_mode_falls_back_to_auto() {
-        let map = env_map(&[
-            ("VISION_URL", "http://vision/v1/chat/completions"),
-            ("VISION_API_KEY", "k"),
-            ("VISION_MODEL", "m"),
-            ("VISION_PROMPT_MODE", "bogus"),
-        ]);
-        let cfg = parse_with(&map).unwrap();
-        assert_eq!(cfg.prompt_mode, "auto");
-
-        // Case-insensitive and trimmed values are accepted.
-        let map = env_map(&[
-            ("VISION_URL", "http://vision/v1/chat/completions"),
-            ("VISION_API_KEY", "k"),
-            ("VISION_MODEL", "m"),
-            ("VISION_PROMPT_MODE", "  UI  "),
-        ]);
-        let cfg = parse_with(&map).unwrap();
-        assert_eq!(cfg.prompt_mode, "ui");
-    }
-
-    #[test]
-    fn parse_vision_config_blank_custom_prompt_is_none() {
-        let map = env_map(&[
-            ("VISION_URL", "http://vision/v1/chat/completions"),
-            ("VISION_API_KEY", "k"),
-            ("VISION_MODEL", "m"),
-            ("VISION_PROMPT", "   "),
-        ]);
-        let cfg = parse_with(&map).unwrap();
-        assert_eq!(cfg.custom_prompt, None);
-    }
-
-    #[test]
-    fn parse_vision_config_max_tokens_validation() {
-        let url = ("VISION_URL", "http://vision/v1/chat/completions");
-        let key = ("VISION_API_KEY", "k");
-        let model = ("VISION_MODEL", "m");
-
-        for (raw, expected) in [
-            ("abc", None),
-            ("0", None),
-            ("", None),
-            ("-1", None),
-            ("1024", Some(1024)),
-        ] {
-            let mut map = env_map(&[url, key, model]);
-            if !raw.is_empty() {
-                map.insert("VISION_MAX_TOKENS".into(), raw.into());
-            }
-            let cfg = parse_with(&map).unwrap();
-            assert_eq!(cfg.max_tokens, expected, "VISION_MAX_TOKENS={raw:?}");
-        }
-    }
-
-    #[test]
-    fn parse_vision_config_missing_required_returns_none() {
-        // Missing VISION_API_KEY → whole vision config disabled (additive gate).
-        let map = env_map(&[("VISION_URL", "http://vision/v1/chat/completions"), ("VISION_MODEL", "m")]);
-        assert!(parse_vision_config_with(|name| map.get(name).cloned()).unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------

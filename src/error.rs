@@ -49,12 +49,6 @@ pub enum Error {
     },
 }
 
-impl From<std::num::ParseIntError> for Error {
-    fn from(e: std::num::ParseIntError) -> Self {
-        Error::Config(format!("Invalid port: {e}"))
-    }
-}
-
 impl Error {
     /// HTTP status and message for this error, independent of local entry format.
     pub(crate) fn status_and_message(&self) -> (StatusCode, String) {
