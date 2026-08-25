@@ -1,0 +1,99 @@
+name: build-and-release
+
+on:
+  push:
+    branches: [main]
+
+# 同一分支的连续 push 串行执行，避免并发写坏滚动 latest release
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  build:
+    name: build ${{ matrix.artifact }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: ai-bridge-linux-x86_64
+            bin: ai-bridge
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: ai-bridge-windows-x86_64.exe
+            bin: ai-bridge.exe
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: ai-bridge-macos-arm64
+            bin: ai-bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "release/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/${{ matrix.artifact }}
+
+  release:
+    name: publish releases
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ai-bridge-*
+          merge-multiple: true
+      - name: Extract version
+        shell: bash
+        run: |
+          VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Publish rolling latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT_SHA="$(git rev-parse --short=8 HEAD)"
+          gh release delete latest --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest artifacts/* --repo "$GITHUB_REPOSITORY" \
+            --title "ai-bridge v$VERSION (latest)" \
+            --notes "Latest build from ${GITHUB_SHA} (${SHORT_SHA})." \
+            >/dev/null
+      - name: Publish per-commit release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT_SHA="$(git rev-parse --short=8 HEAD)"
+          gh release create "build-$GITHUB_SHA" artifacts/* --repo "$GITHUB_REPOSITORY" \
+            --title "ai-bridge v$VERSION build $SHORT_SHA" \
+            --notes "Auto-built from commit ${GITHUB_SHA}." \
+            >/dev/null
