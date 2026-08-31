@@ -26,14 +26,15 @@ const USAGE: &str = "\
 ai-bridge — local Anthropic/OpenAI-compatible bridge to one configured upstream
 
 Usage:
-  ai-bridge              Load ~/.ai-bridge/default.toml
+  ai-bridge              Load the recorded profile (default.toml on first run)
   ai-bridge <profile>    Load ~/.ai-bridge/<profile>.toml
   ai-bridge -l, --list   List available profiles (* marks the current selection)
   ai-bridge -h, --help   Show this help";
 
 enum Cli {
-    /// Serve using the named profile (`default` when the CLI passes none).
-    Run { profile: String },
+    /// Serve the named profile; `None` = bare launch, resolved to the
+    /// persisted current profile (or `default`) at serve time.
+    Run { profile: Option<String> },
     List,
     Help,
 }
@@ -75,11 +76,9 @@ fn parse_cli(args: &[OsString]) -> Result<Cli, String> {
     }
 
     match positional.len() {
-        0 => Ok(Cli::Run {
-            profile: DEFAULT_PROFILE.to_string(),
-        }),
+        0 => Ok(Cli::Run { profile: None }),
         1 => Ok(Cli::Run {
-            profile: positional.remove(0),
+            profile: Some(positional.remove(0)),
         }),
         n => Err(format!(
             "Expected at most one profile name (got {n}: {})",
@@ -123,7 +122,16 @@ async fn run(cli: Cli) -> Result<(), Error> {
         }
         // Help is answered synchronously in main(); nothing to do here.
         Cli::Help => Ok(()),
-        Cli::Run { profile } => run_server(&profile).await,
+        Cli::Run { profile: Some(profile) } => run_server(&profile).await,
+        Cli::Run { profile: None } => {
+            // Bare launch: serve the recorded current profile (ADR-0007),
+            // `default` when nothing has been recorded yet. An invalid or
+            // deleted recorded profile errors exactly like an explicit
+            // `ai-bridge <name>` — `run_server` validates and loads it.
+            let base_dir = config::home_config_dir()?;
+            let profile = config::resolve_bare_profile(&base_dir);
+            run_server(&profile).await
+        }
     }
 }
 
@@ -312,13 +320,24 @@ mod tests {
     }
 
     #[test]
-    fn no_args_runs_default_profile() {
-        assert!(matches!(cli(&[]).unwrap(), Cli::Run { profile } if profile == "default"));
+    fn no_args_is_bare_run() {
+        assert!(matches!(cli(&[]).unwrap(), Cli::Run { profile: None }));
     }
 
     #[test]
     fn positional_selects_profile() {
-        assert!(matches!(cli(&["deepseek"]).unwrap(), Cli::Run { profile } if profile == "deepseek"));
+        assert!(
+            matches!(cli(&["deepseek"]).unwrap(), Cli::Run { profile: Some(profile) } if profile == "deepseek")
+        );
+    }
+
+    #[test]
+    fn explicit_default_is_passed_through() {
+        // `ai-bridge default` is explicit, not a bare launch: it must load
+        // default even when another profile is recorded.
+        assert!(
+            matches!(cli(&["default"]).unwrap(), Cli::Run { profile: Some(profile) } if profile == "default")
+        );
     }
 
     #[test]

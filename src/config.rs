@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 /// Configuration lives in `~/.ai-bridge/<profile>.toml` (ADR-0005): one file
 /// per upstream configuration, selected by CLI argument (`ai-bridge <name>`
-/// → `<name>.toml`), defaulting to `default.toml`. The former `UPSTREAM_*` /
+/// → `<name>.toml`), or for a bare `ai-bridge` launch by the recorded
+/// last-served profile in `.settings.toml` (ADR-0006/0007), falling back to
+/// `default.toml` when no selection is recorded. The former `UPSTREAM_*` /
 /// `VISION_*` / `LISTEN_*` environment variables are gone; only `RUST_LOG`
 /// is still read from the environment (tracing convention).
 pub(crate) const CONFIG_DIR_NAME: &str = ".ai-bridge";
@@ -32,7 +34,7 @@ const DEFAULT_TEMPLATE: &str = r#"# ai-bridge config profile — this file is au
 # fill in the required fields below and you're ready to start.
 #
 # Usage:
-#   ai-bridge            loads ~/.ai-bridge/default.toml (this file)
+#   ai-bridge            loads the last recorded profile (this file the first time)
 #   ai-bridge <name>     loads ~/.ai-bridge/<name>.toml
 #   ai-bridge --list     lists all available profiles
 #
@@ -44,7 +46,9 @@ const DEFAULT_TEMPLATE: &str = r#"# ai-bridge config profile — this file is au
 # Every successful launch records the used profile name in
 # ~/.ai-bridge/.settings.toml (a dot-prefixed hidden file maintained by
 # ai-bridge); ai-bridge --list marks the current selection with * and
-# ignores all dot-prefixed files.
+# ignores all dot-prefixed files. A bare `ai-bridge` launch serves the
+# recorded profile again (ADR-0007); `default.toml` is only the fallback
+# when nothing has been recorded yet.
 
 # ===================== Required =====================
 
@@ -278,6 +282,14 @@ pub(crate) fn save_current_profile(base_dir: &Path, name: &str) -> Result<(), Er
     })
 }
 
+/// Profile served by a bare launch (no CLI argument): the persisted current
+/// selection (ADR-0006), or `default` when no selection is recorded. The name
+/// is passed through unchecked — an invalid name or a deleted profile errors
+/// exactly like an explicit `ai-bridge <name>` (ADR-0007).
+pub(crate) fn resolve_bare_profile(base_dir: &Path) -> String {
+    current_profile(base_dir).unwrap_or_else(|| DEFAULT_PROFILE.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Raw serde layer → runtime Config conversion
 // ---------------------------------------------------------------------------
@@ -441,8 +453,9 @@ fn build_vision_config(raw: RawVision) -> Option<VisionConfig> {
 mod tests {
     use super::{
         build_vision_config, config_dir, current_profile, list_profiles, load_profile,
-        profile_path, save_current_profile, settings_path, validate_profile_name,
-        write_default_template, LoadedProfile, RawVision, DEFAULT_PROFILE, SETTINGS_FILE,
+        profile_path, resolve_bare_profile, save_current_profile, settings_path,
+        validate_profile_name, write_default_template, LoadedProfile, RawVision, DEFAULT_PROFILE,
+        SETTINGS_FILE,
     };
     use crate::forward::{ReasoningEffortOverride, UpstreamType};
     use std::fs;
@@ -933,5 +946,35 @@ X-V = "1"
             load_profile(dir.path(), "settings").expect("loads").name,
             "settings"
         );
+    }
+
+    #[test]
+    fn resolve_bare_profile_uses_saved_profile() {
+        let dir = tempdir().unwrap();
+        write_profile(dir.path(), "saved", MINIMAL_TOML);
+        save_current_profile(dir.path(), "saved").unwrap();
+        assert_eq!(resolve_bare_profile(dir.path()), "saved");
+    }
+
+    #[test]
+    fn resolve_bare_profile_missing_settings_defaults() {
+        let dir = tempdir().unwrap();
+        assert_eq!(resolve_bare_profile(dir.path()), DEFAULT_PROFILE);
+    }
+
+    #[test]
+    fn resolve_bare_profile_corrupt_settings_defaults() {
+        let dir = tempdir().unwrap();
+        fs::write(settings_path(dir.path()), "not a toml [[[").unwrap();
+        assert_eq!(resolve_bare_profile(dir.path()), DEFAULT_PROFILE);
+    }
+
+    #[test]
+    fn resolve_bare_profile_passes_through_deleted_profile() {
+        // A recorded profile that no longer exists is passed through, so
+        // startup errors exactly like an explicit `ai-bridge ghost`.
+        let dir = tempdir().unwrap();
+        save_current_profile(dir.path(), "ghost").unwrap();
+        assert_eq!(resolve_bare_profile(dir.path()), "ghost");
     }
 }

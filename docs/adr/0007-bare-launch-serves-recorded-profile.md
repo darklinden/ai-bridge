@@ -1,0 +1,14 @@
+# Bare `ai-bridge` launches serve the recorded current profile
+
+A bare launch (no CLI argument) resolves its profile by priority: **explicit name > recorded `current_profile` > `default`**. `ai-bridge` without arguments serves the profile recorded in `~/.ai-bridge/.settings.toml` (ADR-0006); only when no selection is recorded — no settings file, corrupt TOML, or absent key — does it fall back to `default`. An explicit `ai-bridge default` is *not* a bare launch: it loads `default.toml` directly, bypassing the record.
+
+Resolution lives in `config::resolve_bare_profile`: it returns the recorded name as-is, or `default` when the record is unreadable. The name is deliberately **not** validated or checked for existence at resolution time — `run_server`'s existing `validate_profile_name` + `load_profile` handle it exactly as for an explicit `ai-bridge <name>`, so a hand-edited invalid name or a deleted recorded profile produces the same error as typing the name, never a silent switch to another upstream.
+
+Rationale:
+
+- **Recorded-then-ignored is half a feature** — ADR-0006 made the current selection answerable with `--list`; a bare launch that overrides it with `default` (and then re-records `default`) actively destroys the selection, so the record was never usable as a repeatable "serve what I last chose".
+- **Explicit beats implicit** — the recorded file is bookkeeping with lower authority than a command-line name; pinning a profile must always win over whatever the settings file says, and `ai-bridge default` remains the escape hatch to force `default`.
+- **Degraded records degrade quietly, named-but-missing profiles fail loudly** — an unreadable settings file (missing/corrupt/nonexistent key) silently means "no selection", matching ADR-0006's "`--list` must never fail" philosophy; but once a record exists, it is a real name with the same failure semantics as typing it, so a deleted profile errors instead of silently serving a different upstream (ADR-0007 supersedes the warn-and-fallback alternative considered at design time).
+- **No new failure modes for first-run** — a fresh install has no settings file, so bare `ai-bridge` still resolves `default`, writes the starter template on a missing file, and errors with the same guidance as before.
+
+Consequences: bare launches round-trip the previous selection, so `--list`'s `*` now agrees with what a bare launch serves; deleting a recorded profile makes the next bare launch fail with "Profile config not found" until the selection is fixed (`ai-bridge <name>` re-records on success); the settings file is read exactly once per bare launch (in `run()`), and the serving `run_server` re-records what was actually served, so a bare launch that resolved through the record writes the same name back. Cost: one extra `$HOME` resolution per bare launch, negligible.

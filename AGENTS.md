@@ -7,13 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-cargo build          # build
-cargo run            # serve ~/.ai-bridge/default.toml (needs upstream_type + url + api_key)
-cargo run -- deepseek            # serve ~/.ai-bridge/deepseek.toml instead
-cargo run -- --list              # list available profiles
-cargo test           # run all unit tests
-cargo test <module>            # run one module's tests, e.g. cargo test reasoning_bridge
-cargo test <module>::<test>    # run a single test, e.g. cargo test forward::parses_simple_pairs
+cargo build                     # build
+cargo run                       # serve the recorded profile (default.toml on first run; needs upstream_type + url + api_key)
+cargo run -- deepseek           # serve ~/.ai-bridge/deepseek.toml instead
+cargo run -- --list             # list available profiles
+cargo test                      # run all unit tests
+cargo test <module>             # run one module's tests, e.g. cargo test reasoning_bridge
+cargo test <module>::<test>     # run a single test, e.g. cargo test forward::parses_simple_pairs
 ```
 
 Tests are inline `#[cfg(test)] mod tests` — there is no `tests/` integration directory. Module with the most coverage: `transform_responses` (18), `convert_reverse` (8), `responses_reverse` (5), `tool_media` (14), `media_sanitizer` (10), `reasoning_bridge` (9). `streaming_responses` and `server` have no unit tests and are verified manually / via end-to-end.
@@ -54,9 +54,9 @@ Three layers, in dependency order:
 - **Error format follows the local entry**, not the upstream.
 - **OpenAI-only fields that Anthropic cannot represent** are dropped with a WARN; `n > 1` is rejected (400) because Anthropic is single-output; `parallel_tool_calls=false` maps to `tool_choice.disable_parallel_tool_use`.
 - **Prompt-cache stability matters** — tool-result payloads that are byte-identical reuse upstream prompt caches. Use `json_canonical::canonical_json_string` for cache-sensitive payloads; do not reorder keys casually.
-- **Current-selection persistence is best-effort** — every successful launch writes the served profile to `~/.ai-bridge/.settings.toml` (via `config::save_current_profile` in `run_server`); a write failure must only WARN, never block serving, mirroring `write_default_template`. `--list` marks the current selection with `*` and ignores all dot-prefixed files; a missing or corrupt settings file only means no marker, never an error.
+- **Current-selection persistence is best-effort** — every successful launch writes the served profile to `~/.ai-bridge/.settings.toml` (via `config::save_current_profile` in `run_server`); a write failure must only WARN, never block serving, mirroring `write_default_template`. `--list` marks the current selection with `*` and ignores all dot-prefixed files; a missing or corrupt settings file only means no marker, never an error. **A bare launch serves the recorded profile** (`config::resolve_bare_profile`, ADR-0007) — explicit names always win; no record means `default`; an invalid or deleted recorded profile errors exactly like typing it, never a silent fallback.
 - **Add tests alongside conversion changes** — `streaming_responses` has none and is the riskiest untested surface; conversion modules expect inline `#[cfg(test)]` tests.
 
 ## Terminology
 
-See `CONTEXT.md` for the glossary (Upstream, Local entry, Request log, Media description). Architectural decisions live in `docs/adr/0001-0006`.
+See `CONTEXT.md` for the glossary (Upstream, Local entry, Request log, Media description). Architectural decisions live in `docs/adr/0001-0007`.

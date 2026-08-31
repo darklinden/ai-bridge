@@ -11,8 +11,8 @@ SCRIPT_DIR="$(realpath "${BASEDIR}")"
 #   实时看日志                       : tail -f logs/ai-bridge-$(date +%Y%m%d).log
 #
 # 说明：
-#   - [profile] 原样透传给 ai-bridge：缺省加载 ~/.ai-bridge/default.toml，
-#     `./run.sh deepseek` 加载 ~/.ai-bridge/deepseek.toml，
+#   - [profile] 原样透传给 ai-bridge：缺省加载上次记录的 profile（首次为
+#     ~/.ai-bridge/default.toml），`./run.sh deepseek` 加载 ~/.ai-bridge/deepseek.toml，
 #     `./run.sh --list` 列出所有配置。
 #   - 日志写到 logs/ai-bridge-YYYYMMDD.log，每天一个文件，天然按天轮转。
 #   - reqlog.rs 直写 stdout（绕过 tracing），tracing 输出也走 stdout；

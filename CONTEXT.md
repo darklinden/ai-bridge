@@ -13,7 +13,7 @@ _Avoid_: 上游, backend, provider
 _Avoid_: 本地接口, endpoint, route
 
 **Profile**:
-一份 TOML 配置文件 `~/.ai-bridge/<name>.toml`（ADR-0005），描述一个完整的上游配置。启动时按名字选择（缺省 `default.toml`），`--list` 可列出全部。每次成功启动都会把所用 profile 记入 `~/.ai-bridge/.settings.toml`（点前缀隐藏文件，ai-bridge 自动维护，存 `current_profile` 键）；`--list` 用 `*` 标记当前选择。
+一份 TOML 配置文件 `~/.ai-bridge/<name>.toml`（ADR-0005），描述一个完整的上游配置。启动时按名字选择，无参数时加载上次记录的 profile（首次为 `default.toml`），`--list` 可列出全部。每次成功启动都会把所用 profile 记入 `~/.ai-bridge/.settings.toml`（点前缀隐藏文件，ai-bridge 自动维护，存 `current_profile` 键）；`--list` 用 `*` 标记当前选择。
 _Avoid_: config file, env, 环境变量
 
 **Request log**:

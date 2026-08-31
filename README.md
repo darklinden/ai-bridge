@@ -45,7 +45,7 @@ cargo build --release
 Create a profile config (see below), then:
 
 ```bash
-./target/release/ai-bridge            # loads ~/.ai-bridge/default.toml
+./target/release/ai-bridge            # loads the recorded profile (default.toml on first run)
 ./target/release/ai-bridge deepseek   # loads ~/.ai-bridge/deepseek.toml
 ```
 
@@ -75,7 +75,7 @@ Existing files are never overwritten. Copy `default.toml` under another name to 
 
 | Command | Behavior |
 | --- | --- |
-| `ai-bridge` | Serve using `~/.ai-bridge/default.toml`. |
+| `ai-bridge` | Serve using the recorded profile (`~/.ai-bridge/default.toml` on first run). |
 | `ai-bridge <profile>` | Serve using `~/.ai-bridge/<profile>.toml`. Profile names accept letters, digits, `_`, `-`. |
 | `ai-bridge -l`, `--list` | List available profiles (`*` marks the current selection). Missing/empty directory prints a hint, not an error. |
 | `ai-bridge -h`, `--help` | Show usage. |
@@ -86,7 +86,7 @@ Startup config problems exit with status 1 and a `配置错误:` message naming 
 
 One file = one upstream configuration, stored as `~/.ai-bridge/<profile>.toml` (ADR-0005). Unknown keys are rejected at startup to catch typos.
 
-Every successful launch records the served profile in `~/.ai-bridge/.settings.toml` — a dot-prefixed file auto-managed by `ai-bridge` that holds `current_profile = "<name>"` (so `ai-bridge a` then `ai-bridge b` switches the recorded selection). `--list` marks the current selection with `*` and ignores all dot-prefixed files, so the settings file never shows up as a profile; a missing or corrupt settings file only means `--list` shows no marker. Saving the selection is best-effort: a read-only config dir still serves, with a WARN.
+Every successful launch records the served profile in `~/.ai-bridge/.settings.toml` — a dot-prefixed file auto-managed by `ai-bridge` that holds `current_profile = "<name>"` (so `ai-bridge a` then `ai-bridge b` switches the recorded selection). A bare `ai-bridge` launch re-serves the recorded profile (ADR-0007); a missing, corrupt, or keyless record falls back to `default`, while a recorded name that is invalid or whose file was deleted errors exactly like typing `ai-bridge <name>`. `--list` marks the current selection with `*` and ignores all dot-prefixed files, so the settings file never shows up as a profile; a missing or corrupt settings file only means `--list` shows no marker. Saving the selection is best-effort: a read-only config dir still serves, with a WARN.
 
 ```toml
 # ---- required ----
@@ -216,6 +216,7 @@ Add tests alongside conversion changes — especially `streaming_responses`, whi
   - [0004: Media description via a vision model](docs/adr/0004-media-description-via-vision-model.md)
   - [0005: Configuration moves from environment variables to TOML profiles](docs/adr/0005-toml-profile-config.md)
   - [0006: Current profile selection is persisted in `.settings.toml`](docs/adr/0006-current-profile-selection.md)
+  - [0007: Bare launches serve the recorded profile](docs/adr/0007-bare-launch-serves-recorded-profile.md)
 
 ## Acknowledgments
 
