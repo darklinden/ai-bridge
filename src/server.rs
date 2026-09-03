@@ -106,6 +106,180 @@ fn extract_openai_chat_text(content: Option<&Value>) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Non-streaming response text extraction (appended onto the `[RESP]` line)
+// ---------------------------------------------------------------------------
+//
+// Streaming handlers log response text live from SSE deltas; the non-streaming
+// handlers only print a fixed summary (`ok` / `stop_reason=...`). These
+// extractors pull the loggable plain text out of each wire format's *final*
+// response body so a non-streaming reply (e.g. a safety-judge `{"allow":false}`
+// verdict) is visible on the `[RESP #id]` line too. They mirror the streaming
+// logger's conventions: text verbatim, hidden reasoning tagged `(thinking)`,
+// tool calls collapsed to a `[tool_use: {name}]` marker. Empty responses
+// return `""` so callers keep the bare summary line.
+
+/// Anthropic Messages response → plain text (`content[]` blocks).
+fn anthropic_resp_text(body: &Value) -> String {
+    let Some(blocks) = body.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let parts: Vec<String> = blocks
+        .iter()
+        .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+            Some("text") => b.get("text").and_then(Value::as_str).map(str::to_string),
+            Some("thinking") => b
+                .get("thinking")
+                .and_then(Value::as_str)
+                .map(|t| format!("{t} (thinking)")),
+            Some("tool_use") => b
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|n| format!("[tool_use: {n}]")),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        single_line(&parts.join(" "))
+    }
+}
+
+/// OpenAI Chat response → plain text (`choices[0].message`).
+fn chat_resp_text(body: &Value) -> String {
+    let Some(message) = body.pointer("/choices/0/message") else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(rc) = message.get("reasoning_content").and_then(Value::as_str) {
+        if !rc.is_empty() {
+            parts.push(format!("{rc} (thinking)"));
+        }
+    }
+    match message.get("content") {
+        Some(Value::String(s)) => {
+            if !s.is_empty() {
+                parts.push(s.clone());
+            }
+        }
+        Some(Value::Array(items)) => {
+            for p in items {
+                let t = p.get("type").and_then(Value::as_str).unwrap_or("");
+                match t {
+                    "text" | "output_text" | "input_text" => {
+                        if let Some(s) = p.get("text").and_then(Value::as_str) {
+                            if !s.is_empty() {
+                                parts.push(s.to_string());
+                            }
+                        }
+                    }
+                    "refusal" => {
+                        if let Some(s) = p.get("refusal").and_then(Value::as_str) {
+                            if !s.is_empty() {
+                                parts.push(s.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    // Some providers put a refusal at message level (not in content parts).
+    if let Some(refusal) = message.get("refusal").and_then(Value::as_str) {
+        if !refusal.is_empty() {
+            parts.push(refusal.to_string());
+        }
+    }
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for c in calls {
+            if let Some(n) = c.pointer("/function/name").and_then(Value::as_str) {
+                if !n.is_empty() {
+                    parts.push(format!("[tool_use: {n}]"));
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        single_line(&parts.join(" "))
+    }
+}
+
+/// Compose the non-streaming `[RESP]` line summary: the fixed marker (`ok` /
+/// `stop_reason=...`) plus the extracted response text when there is any.
+fn resp_summary(base: &str, text: &str) -> String {
+    if text.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} {text}")
+    }
+}
+
+/// OpenAI Responses response → plain text (`output[]` items).
+fn responses_resp_text(body: &Value) -> String {
+    let Some(output) = body.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(content) = item.get("content").and_then(Value::as_array) {
+                    for block in content {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("output_text") => {
+                                if let Some(s) = block.get("text").and_then(Value::as_str) {
+                                    if !s.is_empty() {
+                                        parts.push(s.to_string());
+                                    }
+                                }
+                            }
+                            Some("refusal") => {
+                                if let Some(s) = block.get("refusal").and_then(Value::as_str) {
+                                    if !s.is_empty() {
+                                        parts.push(s.to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                if let Some(n) = item.get("name").and_then(Value::as_str) {
+                    if !n.is_empty() {
+                        parts.push(format!("[tool_use: {n}]"));
+                    }
+                }
+            }
+            Some("reasoning") => {
+                if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                    for s in summary {
+                        if let Some(t) = s.get("text").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                parts.push(format!("{t} (thinking)"));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        single_line(&parts.join(" "))
+    }
+}
+
 pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/messages", post(handle_messages))
@@ -521,7 +695,15 @@ async fn handle_passthrough(
             Ok(v) => v,
             Err(e) => return Ok(handle_forward_error(reqlog, e, entry)),
         };
-        reqlog.resp(&format!("stop_reason=passthrough ({model})"));
+        let text = match entry {
+            LocalEntry::AnthropicMessages => anthropic_resp_text(&upstream_resp),
+            LocalEntry::OaiChat => chat_resp_text(&upstream_resp),
+            LocalEntry::OaiResponses => responses_resp_text(&upstream_resp),
+        };
+        reqlog.resp(&resp_summary(
+            &format!("stop_reason=passthrough ({model})"),
+            &text,
+        ));
         Ok(Json(upstream_resp).into_response())
     }
 }
@@ -579,7 +761,10 @@ async fn handle_anthropic_entry_to_chat(
             .get("stop_reason")
             .and_then(|r| r.as_str())
             .unwrap_or("?");
-        reqlog.resp(&format!("stop_reason={}", stop_reason));
+        reqlog.resp(&resp_summary(
+            &format!("stop_reason={stop_reason}"),
+            &anthropic_resp_text(&anthropic_response),
+        ));
         Ok(Json(anthropic_response).into_response())
     }
 }
@@ -643,7 +828,10 @@ async fn handle_anthropic_entry_to_responses(
             .get("stop_reason")
             .and_then(|r| r.as_str())
             .unwrap_or("?");
-        reqlog.resp(&format!("stop_reason={}", stop_reason));
+        reqlog.resp(&resp_summary(
+            &format!("stop_reason={stop_reason}"),
+            &anthropic_resp_text(&anthropic_response),
+        ));
         Ok(Json(anthropic_response).into_response())
     }
 }
@@ -707,7 +895,7 @@ async fn handle_chat_entry_to_anthropic(
                 return Err(e);
             }
         };
-        reqlog.resp("ok");
+        reqlog.resp(&resp_summary("ok", &chat_resp_text(&chat_response)));
         Ok(Json(chat_response).into_response())
     }
 }
@@ -786,7 +974,7 @@ async fn handle_chat_entry_to_responses(
                 return Err(e);
             }
         };
-        reqlog.resp("ok");
+        reqlog.resp(&resp_summary("ok", &chat_resp_text(&chat_response)));
         Ok(Json(chat_response).into_response())
     }
 }
@@ -852,7 +1040,7 @@ async fn handle_responses_entry_to_anthropic(
                 return Err(e);
             }
         };
-        reqlog.resp("ok");
+        reqlog.resp(&resp_summary("ok", &responses_resp_text(&responses_response)));
         Ok(Json(responses_response).into_response())
     }
 }
@@ -930,7 +1118,7 @@ async fn handle_responses_entry_to_chat(
                     return Err(e);
                 }
             };
-        reqlog.resp("ok");
+        reqlog.resp(&resp_summary("ok", &responses_resp_text(&responses_response)));
         Ok(Json(responses_response).into_response())
     }
 }
@@ -1053,6 +1241,131 @@ mod tests {
 
     fn header(map: &mut HeaderMap, name: &'static str, value: &'static str) {
         map.insert(name, HeaderValue::from_static(value));
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-streaming response text extractors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn anthropic_resp_text_joins_text_thinking_and_tool() {
+        let body = json!({
+            "content": [
+                {"type": "text", "text": "Verdict"},
+                {"type": "thinking", "thinking": "because risky"},
+                {"type": "tool_use", "name": "bash", "input": {"command": "rm -rf /"}},
+            ]
+        });
+        assert_eq!(
+            anthropic_resp_text(&body),
+            "Verdict because risky (thinking) [tool_use: bash]"
+        );
+    }
+
+    #[test]
+    fn anthropic_resp_text_empty_or_no_content_is_empty() {
+        assert_eq!(anthropic_resp_text(&json!({"content": []})), "");
+        assert_eq!(anthropic_resp_text(&json!({"stop_reason": "end_turn"})), "");
+        assert_eq!(anthropic_resp_text(&json!({"content": [{"type": "image", "source": {}}]})), "");
+    }
+
+    #[test]
+    fn anthropic_resp_text_collapses_newlines_to_one_line() {
+        let body = json!({"content": [{"type": "text", "text": "line1\nline2"}]});
+        assert_eq!(anthropic_resp_text(&body), "line1 line2");
+    }
+
+    #[test]
+    fn chat_resp_text_string_content_and_reasoning() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "content": "hello",
+                    "reasoning_content": "let me think"
+                }
+            }]
+        });
+        assert_eq!(
+            chat_resp_text(&body),
+            "let me think (thinking) hello"
+        );
+    }
+
+    #[test]
+    fn chat_resp_text_array_parts_and_refusal() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "a"},
+                        {"type": "refusal", "refusal": "cannot do that"}
+                    ],
+                    "refusal": "cannot do that"
+                }
+            }]
+        });
+        // message-level refusal is also folded in (dedup not required, but
+        // it must appear).
+        let text = chat_resp_text(&body);
+        assert!(text.contains("a"));
+        assert!(text.contains("cannot do that"));
+    }
+
+    #[test]
+    fn chat_resp_text_tool_calls_marker() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [
+                        {"function": {"name": "bash", "arguments": "{}"}},
+                        {"function": {"name": "read_file", "arguments": "{}"}},
+                    ]
+                }
+            }]
+        });
+        assert_eq!(chat_resp_text(&body), "[tool_use: bash] [tool_use: read_file]");
+    }
+
+    #[test]
+    fn chat_resp_text_empty_is_empty() {
+        assert_eq!(
+            chat_resp_text(&json!({"choices": [{"message": {"content": null}}]})),
+            ""
+        );
+        assert_eq!(chat_resp_text(&json!({})), "");
+    }
+
+    #[test]
+    fn responses_resp_text_message_and_function_call() {
+        let body = json!({
+            "output": [
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "answer"}
+                ]},
+                {"type": "function_call", "name": "get_weather", "arguments": "{}"},
+                {"type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": "reasoning here"}
+                ]}
+            ]
+        });
+        assert_eq!(
+            responses_resp_text(&body),
+            "answer [tool_use: get_weather] reasoning here (thinking)"
+        );
+    }
+
+    #[test]
+    fn responses_resp_text_empty_is_empty() {
+        assert_eq!(responses_resp_text(&json!({"output": []})), "");
+        assert_eq!(responses_resp_text(&json!({})), "");
+    }
+
+    #[test]
+    fn resp_summary_appends_text_only_when_present() {
+        assert_eq!(resp_summary("ok", ""), "ok");
+        assert_eq!(resp_summary("ok", "hello"), "ok hello");
+        assert_eq!(resp_summary("stop_reason=end_turn", "hi"), "stop_reason=end_turn hi");
     }
 
     // -----------------------------------------------------------------------
