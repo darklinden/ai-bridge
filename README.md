@@ -1,36 +1,18 @@
 # ai-bridge
 
-A lightweight Rust HTTP proxy that lets local **Anthropic Messages**, **OpenAI Chat Completions**, and **OpenAI Responses** clients all talk to a single configured upstream API. Requests are translated from the local entry format to the upstream format, forwarded, and the response is translated back — so existing SDKs and CLIs keep working unchanged while you point them at a different backend.
+A lightweight Rust HTTP proxy that lets local **Anthropic Messages**, **OpenAI Chat Completions**, and **OpenAI Responses** clients all talk to a single configured upstream API. Requests are translated from the local entry format to the upstream format, forwarded, and the response translated back — so existing SDKs and CLIs keep working unchanged while you point them at a different backend.
 
-Every request/response pair is also written to stdout as a single-line stream, making `ai-bridge` useful both as a gateway and as a conversation logger.
+Every request/response pair is also written out as a single-line log, which makes `ai-bridge` useful as a conversation viewer alongside its job as a gateway.
 
-## Features
+What you get:
 
-- **Three local endpoints, one upstream** — serve `/v1/messages`, `/v1/chat/completions`, and `/v1/responses` simultaneously; all forward to a single upstream chosen via the `upstream_type` key of the selected profile.
-- **Bidirectional format conversion** — requests and responses (non-streaming **and** SSE streaming) are converted in both directions, including cross-format paths (e.g. Chat entry → Responses upstream) via an Anthropic intermediate.
-- **TOML profiles** — configuration lives in `~/.ai-bridge/<name>.toml`; keep several upstream configs side by side (`ai-bridge deepseek`, `ai-bridge anthropic`) and list them with `ai-bridge --list`. No environment variables except `RUST_LOG` (ADR-0005).
-- **Explicit upstream declaration** — the upstream format is declared by the `upstream_type` key, never guessed from the URL.
-- **Always-on request logging** — a compact `[REQ #id]` / `[RESP #id]` line per request, independent of `RUST_LOG`.
-- **Prompt-cache-friendly** — tool-result payloads are serialized canonically so byte-identical payloads reuse upstream prompt caches.
-- **Reasoning bridging** — OpenAI `reasoning` items are preserved across Anthropic's `signature`/redacted-thinking field.
-- **Tool-result media** — structured media blocks in tool results are re-emitted correctly for each entry format.
-- **Vision media description** — when the upstream is a text-only model, images are either described by a configured vision model (ADR-0004) or replaced with an `[Unsupported Image]` placeholder.
-- **Inbound auth & CORS** — optional token auth for local clients, permissive CORS, and a 200 MB request-body limit.
+- **Three local endpoints, one upstream** — `/v1/messages`, `/v1/chat/completions` and `/v1/responses`, all forwarding to one upstream chosen by the profile.
+- **Conversion in both directions**, streaming included, with cross-format paths (e.g. Chat entry → Responses upstream) bridged through Anthropic.
+- **TOML profiles** — keep several upstreams side by side and switch by name; nothing is configured through the environment.
+- **Optional image description** — a text-only upstream can be shown images described by a separately configured vision model.
+- **Inbound token auth** for local clients, permissive CORS, and a 200 MB request-body limit.
 
-## How it works
-
-```
-local entry  →  upstream (format declared by the upstream_type key)
-
-  POST /v1/messages          (Anthropic Messages)
-  POST /v1/chat/completions  (OpenAI Chat)
-  POST /v1/responses         (OpenAI Responses)
-        │
-        └─ upstream = anthropic-messages | oai-chat | oai-responses
-             request conversion → forward → response conversion (mirrored back)
-```
-
-When the local entry and upstream share a wire format, the request is passed through (only the model is overridden). Otherwise the request body is converted to the upstream format before forwarding, and the upstream response is converted back into the local entry's format — including live SSE stream translation.
+This file describes the program as it ships today. Where it disagrees with [`docs/requirements.md`](docs/requirements.md), the requirement is the target and the difference is tracked as a known deviation in [`docs/implementation.md`](docs/implementation.md) § 8.
 
 ## Requirements
 
@@ -80,13 +62,13 @@ Existing files are never overwritten. Copy `default.toml` under another name to 
 | `ai-bridge -l`, `--list` | List available profiles (`*` marks the current selection). Missing/empty directory prints a hint, not an error. |
 | `ai-bridge -h`, `--help` | Show usage. |
 
-Startup config problems exit with status 1 and a `配置错误:` message naming the exact file and cause (missing file, TOML syntax, unknown key, missing required key); CLI misuse exits with status 2 plus usage.
+Startup config problems exit with status 1 and a `configuration error:` message naming the exact file and cause (missing file, TOML syntax, unknown key, missing required key); CLI misuse exits with status 2 plus usage.
 
 ## Configuration
 
-One file = one upstream configuration, stored as `~/.ai-bridge/<profile>.toml` (ADR-0005). Unknown keys are rejected at startup to catch typos.
+One file = one upstream configuration, stored as `~/.ai-bridge/<profile>.toml`. Unknown keys are rejected at startup to catch typos.
 
-Every successful launch records the served profile in `~/.ai-bridge/.settings.toml` — a dot-prefixed file auto-managed by `ai-bridge` that holds `current_profile = "<name>"` (so `ai-bridge a` then `ai-bridge b` switches the recorded selection). A bare `ai-bridge` launch re-serves the recorded profile (ADR-0007); a missing, corrupt, or keyless record falls back to `default`, while a recorded name that is invalid or whose file was deleted errors exactly like typing `ai-bridge <name>`. `--list` marks the current selection with `*` and ignores all dot-prefixed files, so the settings file never shows up as a profile; a missing or corrupt settings file only means `--list` shows no marker. Saving the selection is best-effort: a read-only config dir still serves, with a WARN.
+Every successful launch records the served profile in `~/.ai-bridge/.settings.toml` — a dot-prefixed file auto-managed by `ai-bridge` that holds `current_profile = "<name>"` (so `ai-bridge a` then `ai-bridge b` switches the recorded selection). A bare `ai-bridge` launch re-serves the recorded profile; a missing, corrupt, or keyless record falls back to `default`, while a recorded name that is invalid or whose file was deleted errors exactly like typing `ai-bridge <name>`. `--list` marks the current selection with `*` and ignores all dot-prefixed files, so the settings file never shows up as a profile; a missing or corrupt settings file only means `--list` shows no marker. Saving the selection is best-effort: a read-only config dir still serves, with a WARN.
 
 ```toml
 # ---- required ----
@@ -123,8 +105,10 @@ Key semantics:
 
 - `model` — every request body has its `model` replaced by this value; a client-supplied model never reaches the upstream.
 - `[reasoning] effort` — the single source of truth for the outgoing effort value; only stamped when the client actually asked for reasoning. No per-model mapping exists.
-- `[vision]` — enabled only when `url`, `api_key`, and `model` are all present and non-blank; otherwise vision logs which keys are missing and disables itself.
-- The only environment variable still read is `RUST_LOG` (`tracing` filter, default `info`) — all previous `UPSTREAM_*` / `VISION_*` / `LISTEN_*` variables were removed (ADR-0005), so configuration can no longer leak through shells or `.env` files.
+- `[vision]` — enabled only when `url`, `api_key`, and `model` are all present and non-blank; otherwise vision logs which keys are missing and disables itself. The endpoint's format is inferred from its path today; making it an explicit declaration is a pending change (see the deviations list linked above).
+- Configuration comes only from the profile file. The only variables read are `RUST_LOG` (a `tracing` filter, default `info`) and `HOME` (to locate `~/.ai-bridge`).
+
+Configuration decisions and their rationale are recorded in [`docs/adr/`](docs/adr/).
 
 ## Endpoints
 
@@ -139,29 +123,14 @@ Each accepts the corresponding SDK/CLI request shape (streaming supported), and 
 ### Example
 
 ```bash
+# The Authorization header is only needed when auth_key is set in the profile.
 curl -X POST http://127.0.0.1:18650/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local-token" \     # only if auth_key is set in the profile
+  -H "Authorization: Bearer local-token" \
   -d '{"model": "anything", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-## Conversion matrix
-
-| Local entry \ Upstream | `oai-chat` | `oai-responses` | `anthropic-messages` |
-| --- | --- | --- | --- |
-| Anthropic Messages | direct conversion | direct conversion | pass-through |
-| Chat Completions | pass-through | double-bridge via Anthropic | direct (reverse) conversion |
-| Responses | double-bridge via Anthropic | pass-through | direct (reverse) conversion |
-
-## Behavior notes
-
-- **Model is always overridden** to the profile's `model` on every local entry; a client-supplied `model` never reaches the upstream.
-- **Error format follows the local entry**, not the upstream: Anthropic entries return Anthropic-style errors, OpenAI entries return OpenAI-style errors. Mapping: `Transform`/`Forward` → 502, `Config`/`Server` → 500, `Unauthorized` → 401, `Unsupported` → 400.
-- **OpenAI-only fields** Anthropic cannot represent are dropped with a WARN; `n > 1` is rejected (400) because Anthropic is single-output; `parallel_tool_calls=false` maps to `tool_choice.disable_parallel_tool_use`.
-- **Reasoning items** (OpenAI) have no Anthropic field, so each item is base64-encoded into the Anthropic `signature`/redacted-thinking payload and decoded on replay.
-- **Outbound reasoning policy** — the effort value sent upstream is decided solely by `[reasoning] effort` (default `max`), gated by the `[reasoning] thinking` master switch; no per-model effort mapping exists.
-- **Tool-result media** is extracted from structured blocks and re-emitted as a synthetic user message where the target format only supports plain text.
-- **Prompt-cache stability** — cache-sensitive payloads are serialized with canonical JSON so identical tool results stay byte-identical and reuse upstream caches.
+Which entry converts to which upstream — and which combinations are pass-through — is laid out in [`docs/architecture.md`](docs/architecture.md) § 3.
 
 ## Request logging
 
@@ -182,7 +151,7 @@ Each request/response pair is printed to stdout as single-line records, independ
 
   `[ERR-REQ #id]` lines report the upstream HTTP status (`429`, `503`, ...) plus a human-readable reason extracted from the upstream body (JSON `error.message` or raw text), and the same real status is relayed to the client — no blanket 502.
 - Each pair is preceded by two blank lines for readability.
-- This is a terminal aid, not a durable log — nothing is written to disk.
+- Today the log goes to stdout only — redirect it if you want it on disk (`./run.sh` does exactly that, teeing the whole process into a dated file). A built-in `--log` option is a pending change; the target contract for the log's content and destinations is [ADR-0012](docs/adr/0012-request-log-records-content-verbatim.md).
 
 ## Media & vision
 
@@ -193,30 +162,30 @@ By default (with `vision_supplement` absent or `false`) images are passed throug
 
 The request log notes handled images, e.g. `[media: 2 image(s) → [Unsupported Image]]`.
 
+Why this is opt-in rather than automatic: the "upstream is text-only" check is a model-name heuristic, so a newly released vision-capable model the list has not caught up with would have its images silently swapped for descriptions. See [ADR-0004](docs/adr/0004-media-description-via-vision-model.md).
+
 ## Development
 
-Tests are inline `#[cfg(test)]` modules (no `tests/` integration directory):
+Build and test commands, the testing conventions, and where each kind of change should be documented all live in [`AGENTS.md`](AGENTS.md). In short:
 
 ```bash
-cargo test                    # all unit tests
-cargo test <module>           # one module, e.g. cargo test reasoning_bridge
-cargo test <module>::<test>   # a single test, e.g. cargo test forward::parses_simple_pairs
+cargo test                            # all unit tests
+cargo run                             # serve the recorded profile
+cargo run -- --list                   # list available profiles
 ```
 
-Add tests alongside conversion changes — especially `streaming_responses`, which has no unit tests yet and is the riskiest untested surface.
+The scripts in [`manual-test/`](manual-test/) drive the three entries end-to-end against a running instance.
 
 ## Docs
 
-- [`AGENTS.md`](AGENTS.md) — architecture and invariants for AI agents working on the repo.
-- [`CONTEXT.md`](CONTEXT.md) — glossary of domain terms.
-- [`docs/adr/`](docs/adr/) — architectural decision records:
-  - [0001: Three local entries over one upstream](docs/adr/0001-three-local-entries-over-one-upstream.md)
-  - [0002: Upstream type is explicit, not guessed from URL](docs/adr/0002-upstream-type-is-explicit.md)
-  - [0003: Upstream config renamed to `UPSTREAM_*`](docs/adr/0003-upstream-naming.md)
-  - [0004: Media description via a vision model](docs/adr/0004-media-description-via-vision-model.md)
-  - [0005: Configuration moves from environment variables to TOML profiles](docs/adr/0005-toml-profile-config.md)
-  - [0006: Current profile selection is persisted in `.settings.toml`](docs/adr/0006-current-profile-selection.md)
-  - [0007: Bare launches serve the recorded profile](docs/adr/0007-bare-launch-serves-recorded-profile.md)
+| Document | Contents |
+| --- | --- |
+| [`docs/requirements.md`](docs/requirements.md) | What the proxy must do — functional requirements with how each is verified. |
+| [`docs/architecture.md`](docs/architecture.md) | Module boundaries, the entry × upstream matrix, dependency direction. |
+| [`docs/implementation.md`](docs/implementation.md) | How each mechanism works, the invariants to preserve, and the known deviations. |
+| [`CONTEXT.md`](CONTEXT.md) | Glossary of this project's terms. |
+| [`AGENTS.md`](AGENTS.md) | Map for AI agents working in the repo: commands and conventions. |
+| [`docs/adr/`](docs/adr/) | Architectural decision records, numbered from 0001. |
 
 ## Acknowledgments
 

@@ -1,4 +1,10 @@
+---
+status: superseded by ADR-0005
+---
+
 # Upstream config renamed from OPENAI_COMP_* to UPSTREAM_*
+
+*Superseded by ADR-0005. Kept as history — the naming argument it makes still applies to the profile keys.*
 
 All upstream configuration moved to `UPSTREAM_URL` / `UPSTREAM_API_KEY` / `UPSTREAM_MODEL` / `UPSTREAM_AUTH_KEY`, replacing the `OPENAI_COMP_*` names. The old names are deprecated and removed.
 
