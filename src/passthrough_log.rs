@@ -94,10 +94,17 @@ fn extract_log_fragment(
                         frags.push(text.to_string());
                     }
                 }
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                    if !reasoning.is_empty() {
-                        frags.push(reasoning.to_string());
-                    }
+                // OpenRouter/Kimi spell it `reasoning`, DeepSeek spells it
+                // `reasoning_content` — the same two spellings `convert::Delta`
+                // accepts. Take the first non-empty spelling so the thinking
+                // chain reaches the log whichever one the upstream sends,
+                // without ever appending both copies when a gateway emits both.
+                let reasoning = ["reasoning_content", "reasoning"]
+                    .iter()
+                    .filter_map(|k| delta.get(*k).and_then(Value::as_str))
+                    .find(|s| !s.is_empty());
+                if let Some(reasoning) = reasoning {
+                    frags.push(reasoning.to_string());
                 }
                 if !*resp_has_text {
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -318,6 +325,48 @@ mod tests {
             Some("think".to_string())
         );
         assert!(!has_text);
+    }
+
+    #[test]
+    fn extract_chat_reasoning_alias_field() {
+        // OpenRouter/Kimi-style `delta.reasoning` must be logged too — otherwise
+        // the thinking chain never reaches the [RESP] line on those upstreams.
+        let mut has_text = false;
+        let mut marks = HashSet::new();
+        let ev = an(json!({"id":"1","choices":[{"delta":{"reasoning":"think"}}]}));
+        assert_eq!(
+            extract_log_fragment(StreamFormat::Chat, &ev, &mut has_text, &mut marks),
+            Some("think".to_string())
+        );
+        assert!(!has_text);
+    }
+
+    #[test]
+    fn extract_chat_reasoning_picks_one_spelling_without_duplication() {
+        // Both spellings in one delta → exactly one copy, `reasoning_content`
+        // preferred; a null/empty first spelling falls through to the other.
+        let mut has_text = false;
+        let mut marks = HashSet::new();
+        let both = an(json!({"id":"1","choices":[{"delta":{
+            "reasoning_content":"think","reasoning":"think"}}]}));
+        assert_eq!(
+            extract_log_fragment(StreamFormat::Chat, &both, &mut has_text, &mut marks),
+            Some("think".to_string())
+        );
+
+        let null_first = an(json!({"id":"1","choices":[{"delta":{
+            "reasoning_content":null,"reasoning":"think"}}]}));
+        assert_eq!(
+            extract_log_fragment(StreamFormat::Chat, &null_first, &mut has_text, &mut marks),
+            Some("think".to_string())
+        );
+
+        let empty_first = an(json!({"id":"1","choices":[{"delta":{
+            "reasoning_content":"","reasoning":"think"}}]}));
+        assert_eq!(
+            extract_log_fragment(StreamFormat::Chat, &empty_first, &mut has_text, &mut marks),
+            Some("think".to_string())
+        );
     }
 
     #[test]
