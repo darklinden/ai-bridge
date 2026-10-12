@@ -38,9 +38,15 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: ai-bridge-windows-x86_64.exe
             bin: ai-bridge.exe
-          - os: macos-14
+          # macos-14 已弃用（2026-11-02 退役），改用受支持的 macos-15 (arm64)
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: ai-bridge-macos-arm64
+            bin: ai-bridge
+          # x86_64 在 arm64 runner 上交叉编译（Apple SDK 通用，依赖均为纯 Rust）
+          - os: macos-15
+            target: x86_64-apple-darwin
+            artifact: ai-bridge-macos-x86_64
             bin: ai-bridge
     steps:
       - uses: actions/checkout@v4
