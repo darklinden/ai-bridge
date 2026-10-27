@@ -143,6 +143,11 @@ Each request/response pair is printed to stdout as single-line records, independ
 ```
 
 - Streaming text appends onto the same open `[RESP #id]: ` line, terminated on completion.
+- Tool calls and their results are part of the same lines, verbatim and untruncated:
+  - `[tool_use: {name}] {arguments}` — the model's call, written when the tool's block completes (its arguments only exist once every delta has arrived). An upstream that streams no arguments leaves the bare `[tool_use: {name}]`.
+  - `[tool_result: {id}] {content}` — the tool's output, on the `[REQ]` line: from the `tool_result` blocks of the Anthropic user message, the trailing `role: "tool"` messages of a Chat request, or the trailing `function_call_output` items of a Responses request.
+  - Both markers appear whether or not the model wrote text first.
+  - A tool payload is written as it came, line breaks included, so one record can span several lines; ordinary prose stays folded onto the single line. An unnamed call renders `[tool_use: ?]`.
 - Errors break to a tagged `[ERR-REQ #id]` / `[ERR-RESP #id]` line, also preceded by two blank lines like the `[REQ]`/`[RESP]` markers:
 
   ```text

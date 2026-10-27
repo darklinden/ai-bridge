@@ -17,54 +17,92 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-/// Collapse newlines/whitespace so the complete text stays on a single log line
-/// (replaces line breaks with spaces, does NOT truncate content).
+/// Collapse newlines/whitespace so prose stays on a single log line (replaces
+/// line breaks with spaces, does NOT truncate content).
+///
+/// Applied to prose fragments only. A tool payload goes through
+/// [`crate::reqlog::tool_use_marker`] / [`crate::reqlog::tool_result_marker`]
+/// verbatim, line breaks included (ADR-0012).
 fn single_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// How one extracted fragment is rendered onto the log line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextMode {
+    /// Prose: folded onto the single log line.
+    Fold,
+    /// A tool payload: written as it came, line breaks included (ADR-0012).
+    Verbatim,
+}
+
+/// Render one prose fragment for the log line.
+fn render_text(s: &str, mode: TextMode) -> String {
+    match mode {
+        TextMode::Fold => single_line(s),
+        TextMode::Verbatim => s.to_string(),
+    }
+}
+
+/// Join extracted fragments, dropping the empty ones so a blank fragment cannot
+/// leave a doubled or dangling separator. The mode only picks the separator —
+/// folding happens per fragment in [`render_text`].
+fn join_fragments(parts: &[String], mode: TextMode) -> String {
+    let sep = match mode {
+        TextMode::Fold => " ",
+        TextMode::Verbatim => "\n",
+    };
+    parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(sep)
 }
 
 /// Brief summary of an assistant `tool_use` block: name plus the serialized
 /// arguments the model sent (no truncation).
 fn tool_use_summary(block: &Value) -> String {
     let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-    if let Some(input) = block.get("input") {
-        let s = serde_json::to_string(input).unwrap_or_default();
-        if !s.is_empty() {
-            return format!("[tool_use: {name}] {s}");
-        }
-    }
-    format!("[tool_use: {name}]")
+    let args = block
+        .get("input")
+        .map(|input| serde_json::to_string(input).unwrap_or_default())
+        .unwrap_or_default();
+    crate::reqlog::tool_use_marker(name, &args)
 }
 
 /// Brief summary of a `tool_result` block: id plus the actual tool output
-/// content (string, or flattened text/tool blocks), no truncation.
+/// content (string, or flattened text/tool blocks), no truncation and no
+/// folding — the tool's output is written as it came, newlines included.
 fn tool_result_summary(block: &Value) -> String {
     let id = block.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("?");
+    // A missing/null payload degrades to the bare marker, the same rule the
+    // Chat/Responses path applies in `tool_result_text`.
     let content = match block.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(_)) => extract_text_content(block.get("content")),
-        _ => "/".to_string(),
+        None | Some(Value::Null) => String::new(),
+        Some(c) => extract_text_content(Some(c), TextMode::Verbatim),
     };
-    if content.is_empty() {
-        format!("[tool_result: {id}]")
-    } else {
-        format!("[tool_result: {id}] {content}")
-    }
+    crate::reqlog::tool_result_marker(id, &content)
 }
 
 /// Extract plain text from an Anthropic content field (String, Array of blocks, or null).
 /// Joins multiple text/thinking blocks into the complete text (no truncation).
-fn extract_text_content(content: Option<&Value>) -> String {
+/// `mode` decides how prose is rendered; tool payloads are always verbatim.
+fn extract_text_content(content: Option<&Value>, mode: TextMode) -> String {
     match content {
-        Some(Value::String(s)) => s.clone(),
+        Some(Value::String(s)) => render_text(s, mode),
         Some(Value::Array(blocks)) => {
             let texts: Vec<String> = blocks
                 .iter()
                 .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => b.get("text").and_then(|t| t.as_str()).map(|t| t.to_string()),
-                    Some("thinking") => b.get("thinking").and_then(|t| t.as_str()).map(|t| {
-                        format!("{} (thinking)", t)
-                    }),
+                    Some("text") => b
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| render_text(t, mode)),
+                    Some("thinking") => b
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .map(|t| render_text(&format!("{} (thinking)", t), mode)),
                     Some("tool_use") => Some(tool_use_summary(b)),
                     Some("tool_result") => Some(tool_result_summary(b)),
                     Some("image") => Some("[image]".to_string()),
@@ -76,7 +114,7 @@ fn extract_text_content(content: Option<&Value>) -> String {
             if texts.is_empty() {
                 "[empty]".to_string()
             } else {
-                texts.join(" ")
+                join_fragments(&texts, mode)
             }
         }
         Some(Value::Null) | None => "null".to_string(),
@@ -84,24 +122,28 @@ fn extract_text_content(content: Option<&Value>) -> String {
     }
 }
 
-/// Extract the user prompt text from an OpenAI Chat message content.
-fn extract_openai_chat_text(content: Option<&Value>) -> String {
+/// Extract the user prompt text from an OpenAI Chat message content. `mode`
+/// decides how the text parts are rendered (see [`extract_text_content`]).
+fn extract_openai_chat_text(content: Option<&Value>, mode: TextMode) -> String {
     match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| {
-                let t = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match t {
-                    "text" | "input_text" | "output_text" => {
-                        p.get("text").and_then(|v| v.as_str()).map(str::to_string)
+        Some(Value::String(s)) => render_text(s, mode),
+        Some(Value::Array(parts)) => {
+            let texts: Vec<String> = parts
+                .iter()
+                .filter_map(|p| {
+                    let t = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match t {
+                        "text" | "input_text" | "output_text" => p
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| render_text(s, mode)),
+                        "image_url" | "input_image" => Some("[image]".to_string()),
+                        _ => None,
                     }
-                    "image_url" | "input_image" => Some("[image]".to_string()),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+                })
+                .collect();
+            join_fragments(&texts, mode)
+        }
         _ => "(no content)".to_string(),
     }
 }
@@ -116,8 +158,8 @@ fn extract_openai_chat_text(content: Option<&Value>) -> String {
 // response body so a non-streaming reply (e.g. a safety-judge `{"allow":false}`
 // verdict) is visible on the `[RESP #id]` line too. They mirror the streaming
 // logger's conventions: text verbatim, hidden reasoning tagged `(thinking)`,
-// tool calls collapsed to a `[tool_use: {name}]` marker. Empty responses
-// return `""` so callers keep the bare summary line.
+// tool calls rendered as `[tool_use: {name}] {arguments}` (arguments verbatim,
+// ADR-0012). Empty responses return `""` so callers keep the bare summary line.
 
 /// Anthropic Messages response → plain text (`content[]` blocks).
 fn anthropic_resp_text(body: &Value) -> String {
@@ -127,22 +169,24 @@ fn anthropic_resp_text(body: &Value) -> String {
     let parts: Vec<String> = blocks
         .iter()
         .filter_map(|b| match b.get("type").and_then(Value::as_str) {
-            Some("text") => b.get("text").and_then(Value::as_str).map(str::to_string),
+            Some("text") => b
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|t| render_text(t, TextMode::Fold)),
             Some("thinking") => b
                 .get("thinking")
                 .and_then(Value::as_str)
-                .map(|t| format!("{t} (thinking)")),
-            Some("tool_use") => b
-                .get("name")
-                .and_then(Value::as_str)
-                .map(|n| format!("[tool_use: {n}]")),
+                .map(|t| render_text(&format!("{t} (thinking)"), TextMode::Fold)),
+            Some("tool_use") => Some(tool_use_summary(b)),
             _ => None,
         })
         .collect();
     if parts.is_empty() {
         String::new()
     } else {
-        single_line(&parts.join(" "))
+        // Prose was folded per fragment; a tool call's arguments keep their own
+        // line breaks, so the join must not fold the result again.
+        join_fragments(&parts, TextMode::Fold)
     }
 }
 
@@ -155,13 +199,13 @@ fn chat_resp_text(body: &Value) -> String {
 
     if let Some(rc) = message.get("reasoning_content").and_then(Value::as_str) {
         if !rc.is_empty() {
-            parts.push(format!("{rc} (thinking)"));
+            parts.push(render_text(&format!("{rc} (thinking)"), TextMode::Fold));
         }
     }
     match message.get("content") {
         Some(Value::String(s)) => {
             if !s.is_empty() {
-                parts.push(s.clone());
+                parts.push(render_text(s, TextMode::Fold));
             }
         }
         Some(Value::Array(items)) => {
@@ -171,14 +215,14 @@ fn chat_resp_text(body: &Value) -> String {
                     "text" | "output_text" | "input_text" => {
                         if let Some(s) = p.get("text").and_then(Value::as_str) {
                             if !s.is_empty() {
-                                parts.push(s.to_string());
+                                parts.push(render_text(s, TextMode::Fold));
                             }
                         }
                     }
                     "refusal" => {
                         if let Some(s) = p.get("refusal").and_then(Value::as_str) {
                             if !s.is_empty() {
-                                parts.push(s.to_string());
+                                parts.push(render_text(s, TextMode::Fold));
                             }
                         }
                     }
@@ -191,23 +235,29 @@ fn chat_resp_text(body: &Value) -> String {
     // Some providers put a refusal at message level (not in content parts).
     if let Some(refusal) = message.get("refusal").and_then(Value::as_str) {
         if !refusal.is_empty() {
-            parts.push(refusal.to_string());
+            parts.push(render_text(refusal, TextMode::Fold));
         }
     }
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for c in calls {
-            if let Some(n) = c.pointer("/function/name").and_then(Value::as_str) {
-                if !n.is_empty() {
-                    parts.push(format!("[tool_use: {n}]"));
-                }
-            }
+            // A call the upstream never named still reached the client, so it
+            // is recorded as `[tool_use: ?]` rather than hidden.
+            let n = c
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let args = c
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            parts.push(crate::reqlog::tool_use_marker(n, args));
         }
     }
 
     if parts.is_empty() {
         String::new()
     } else {
-        single_line(&parts.join(" "))
+        join_fragments(&parts, TextMode::Fold)
     }
 }
 
@@ -236,14 +286,14 @@ fn responses_resp_text(body: &Value) -> String {
                             Some("output_text") => {
                                 if let Some(s) = block.get("text").and_then(Value::as_str) {
                                     if !s.is_empty() {
-                                        parts.push(s.to_string());
+                                        parts.push(render_text(s, TextMode::Fold));
                                     }
                                 }
                             }
                             Some("refusal") => {
                                 if let Some(s) = block.get("refusal").and_then(Value::as_str) {
                                     if !s.is_empty() {
-                                        parts.push(s.to_string());
+                                        parts.push(render_text(s, TextMode::Fold));
                                     }
                                 }
                             }
@@ -253,18 +303,18 @@ fn responses_resp_text(body: &Value) -> String {
                 }
             }
             Some("function_call") => {
-                if let Some(n) = item.get("name").and_then(Value::as_str) {
-                    if !n.is_empty() {
-                        parts.push(format!("[tool_use: {n}]"));
-                    }
-                }
+                // A call the upstream never named still reached the client, so
+                // it is recorded as `[tool_use: ?]` rather than hidden.
+                let n = item.get("name").and_then(Value::as_str).unwrap_or("?");
+                let args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                parts.push(crate::reqlog::tool_use_marker(n, args));
             }
             Some("reasoning") => {
                 if let Some(summary) = item.get("summary").and_then(Value::as_array) {
                     for s in summary {
                         if let Some(t) = s.get("text").and_then(Value::as_str) {
                             if !t.is_empty() {
-                                parts.push(format!("{t} (thinking)"));
+                                parts.push(render_text(&format!("{t} (thinking)"), TextMode::Fold));
                             }
                         }
                     }
@@ -276,7 +326,7 @@ fn responses_resp_text(body: &Value) -> String {
     if parts.is_empty() {
         String::new()
     } else {
-        single_line(&parts.join(" "))
+        join_fragments(&parts, TextMode::Fold)
     }
 }
 
@@ -343,7 +393,7 @@ fn extract_system_for_entry(body: &Value, entry: LocalEntry) -> Option<String> {
                     .iter()
                     .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
                 {
-                    let t = extract_openai_chat_text(m.get("content"));
+                    let t = extract_openai_chat_text(m.get("content"), TextMode::Fold);
                     if !t.trim().is_empty() {
                         parts.push(t);
                     }
@@ -364,7 +414,7 @@ fn extract_system_for_entry(body: &Value, entry: LocalEntry) -> Option<String> {
                     .filter(|m| m.get("type").and_then(|t| t.as_str()) == Some("message"))
                     .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
                 {
-                    let t = extract_openai_chat_text(m.get("content"));
+                    let t = extract_openai_chat_text(m.get("content"), TextMode::Fold);
                     if !t.trim().is_empty() {
                         parts.push(t);
                     }
@@ -375,7 +425,8 @@ fn extract_system_for_entry(body: &Value, entry: LocalEntry) -> Option<String> {
     }
 }
 
-/// Extract the user prompt text for the given local entry.
+/// Extract the user prompt text for the given local entry, plus any tool results
+/// that follow it (see [`trailing_tool_results`]).
 fn request_text_for_entry(body: &Value, entry: LocalEntry) -> String {
     match entry {
         LocalEntry::AnthropicMessages => request_text(body),
@@ -383,19 +434,32 @@ fn request_text_for_entry(body: &Value, entry: LocalEntry) -> String {
             let msgs = body.get("messages").and_then(|m| m.as_array());
             let text = match msgs {
                 Some(msgs) => {
-                    let user = msgs
+                    let last_user = msgs
                         .iter()
-                        .rev()
-                        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                        .map(|m| extract_openai_chat_text(m.get("content")))
-                        .unwrap_or_else(|| {
+                        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"));
+                    let user = match last_user {
+                        Some(i) => join_user_and_results(
+                            &extract_openai_chat_text(msgs[i].get("content"), TextMode::Fold),
+                            &trailing_tool_results(&msgs[i + 1..], LocalEntry::OaiChat),
+                        ),
+                        None => {
+                            // No user turn at all: fold every non-tool message
+                            // into the line and render the tool results with the
+                            // usual marker, so they are not spelled two ways.
                             let all: Vec<String> = msgs
                                 .iter()
-                                .map(|m| extract_openai_chat_text(m.get("content")))
+                                .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("tool"))
+                                .map(|m| extract_openai_chat_text(m.get("content"), TextMode::Fold))
                                 .collect();
-                            all.join(" | ")
-                        });
-                    single_line(&user)
+                            join_user_and_results(
+                                &all.join(" | "),
+                                &trailing_tool_results(msgs, LocalEntry::OaiChat),
+                            )
+                        }
+                    };
+                    // The prompt side is already folded; a tool result keeps the
+                    // line breaks it arrived with, so the line is not folded again.
+                    user
                 }
                 None => "(no messages)".to_string(),
             };
@@ -409,16 +473,27 @@ fn request_text_for_entry(body: &Value, entry: LocalEntry) -> String {
             let input = body.get("input").and_then(|i| i.as_array());
             let text = match input {
                 Some(input) => {
-                    let user = input
-                        .iter()
-                        .rev()
-                        .find(|m| {
-                            m.get("type").and_then(|t| t.as_str()) == Some("message")
-                                && m.get("role").and_then(|r| r.as_str()) == Some("user")
-                        })
-                        .map(|m| extract_openai_chat_text(m.get("content")))
-                        .unwrap_or_else(|| "(no messages)".to_string());
-                    single_line(&user)
+                    let last_user = input.iter().rposition(|m| {
+                        m.get("type").and_then(|t| t.as_str()) == Some("message")
+                            && m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    });
+                    let user = match last_user {
+                        Some(i) => join_user_and_results(
+                            &extract_openai_chat_text(input[i].get("content"), TextMode::Fold),
+                            &trailing_tool_results(&input[i + 1..], LocalEntry::OaiResponses),
+                        ),
+                        None => {
+                            // No user turn at all: the only thing worth showing
+                            // is whatever tool results the request carries.
+                            join_user_and_results(
+                                "",
+                                &trailing_tool_results(input, LocalEntry::OaiResponses),
+                            )
+                        }
+                    };
+                    // The prompt side is already folded; a tool result keeps the
+                    // line breaks it arrived with, so the line is not folded again.
+                    user
                 }
                 None => "(no messages)".to_string(),
             };
@@ -428,6 +503,65 @@ fn request_text_for_entry(body: &Value, entry: LocalEntry) -> String {
                 text
             }
         }
+    }
+}
+
+/// Join the user turn with the tool results that follow it. `" | "` is the
+/// separator already used when several messages are folded onto one line, and it
+/// marks the results as separate messages rather than part of the prompt. An
+/// empty side is dropped rather than leaving a dangling separator.
+fn join_user_and_results(user: &str, results: &str) -> String {
+    match (user.trim().is_empty(), results.is_empty()) {
+        (_, true) => user.to_string(),
+        (true, false) => results.to_string(),
+        (false, false) => format!("{user} | {results}"),
+    }
+}
+
+/// Tool results carried by the messages *after* the last user message, rendered
+/// with the same `[tool_result: {id}] {content}` marker the Anthropic entry
+/// already produces for the blocks it finds inline in that message.
+///
+/// Chat carries them in `role:"tool"` messages and Responses in
+/// `function_call_output` items — both are separate messages, so without this
+/// they never reach the `[REQ]` line at all. Anthropic needs nothing here: its
+/// results are content blocks inside the user message itself.
+fn trailing_tool_results(msgs: &[Value], entry: LocalEntry) -> String {
+    let results: Vec<String> = msgs
+        .iter()
+        .filter_map(|m| match entry {
+            LocalEntry::OaiChat if m.get("role").and_then(Value::as_str) == Some("tool") => {
+                let id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or("?");
+                Some(crate::reqlog::tool_result_marker(
+                    id,
+                    &tool_result_text(m.get("content")),
+                ))
+            }
+            LocalEntry::OaiResponses
+                if m.get("type").and_then(Value::as_str) == Some("function_call_output") =>
+            {
+                let id = m.get("call_id").and_then(Value::as_str).unwrap_or("?");
+                Some(crate::reqlog::tool_result_marker(
+                    id,
+                    &tool_result_text(m.get("output")),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    results.join(" ")
+}
+
+/// Text of a tool-result payload, written verbatim (line breaks included). A
+/// missing/null payload renders as empty so the marker degrades to
+/// `[tool_result: {id}]`; a payload that is neither text nor a content array is
+/// serialised as JSON rather than described as "no content".
+fn tool_result_text(payload: Option<&Value>) -> String {
+    match payload {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(v @ Value::Array(_)) => extract_openai_chat_text(Some(v), TextMode::Verbatim),
+        Some(v) => serde_json::to_string(v).unwrap_or_default(),
     }
 }
 
@@ -1184,7 +1318,10 @@ fn handle_forward_error(reqlog: &Arc<ReqLog>, e: Error, entry: LocalEntry) -> Re
 /// or `role == "system"` messages (joined if both present).
 fn extract_system(body: &Value, msgs: Option<&[Value]>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(top) = body.get("system").map(|s| extract_text_content(Some(s))) {
+    if let Some(top) = body
+        .get("system")
+        .map(|s| extract_text_content(Some(s), TextMode::Fold))
+    {
         if !top.trim().is_empty() {
             parts.push(top);
         }
@@ -1194,7 +1331,7 @@ fn extract_system(body: &Value, msgs: Option<&[Value]>) -> Option<String> {
             .iter()
             .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
         {
-            let t = extract_text_content(m.get("content"));
+            let t = extract_text_content(m.get("content"), TextMode::Fold);
             if !t.trim().is_empty() {
                 parts.push(t);
             }
@@ -1206,6 +1343,9 @@ fn extract_system(body: &Value, msgs: Option<&[Value]>) -> Option<String> {
 /// Build the `[REQ]` text (after model): the complete last user message's text.
 /// Falls back to joining all messages' text when there is no user message. The
 /// system prompt is handled separately via `report_system_prompt`.
+///
+/// Prose is folded per fragment; a `tool_result` block in the message keeps the
+/// line breaks of the tool's output, so the assembled line is not folded again.
 fn request_text(body: &Value) -> String {
     let msgs = body.get("messages").and_then(|m| m.as_array());
     match msgs {
@@ -1214,15 +1354,14 @@ fn request_text(body: &Value) -> String {
                 .iter()
                 .rev()
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                .map(|m| extract_text_content(m.get("content")))
+                .map(|m| extract_text_content(m.get("content"), TextMode::Fold))
                 .unwrap_or_else(|| {
                     let all: Vec<String> = msgs
                         .iter()
-                        .map(|m| extract_text_content(m.get("content")))
+                        .map(|m| extract_text_content(m.get("content"), TextMode::Fold))
                         .collect();
                     all.join(" | ")
                 });
-            let user = single_line(&user);
             if user.trim().is_empty() {
                 "(no messages)".to_string()
             } else {
@@ -1258,7 +1397,7 @@ mod tests {
         });
         assert_eq!(
             anthropic_resp_text(&body),
-            "Verdict because risky (thinking) [tool_use: bash]"
+            "Verdict because risky (thinking) [tool_use: bash] {\"command\":\"rm -rf /\"}"
         );
     }
 
@@ -1273,6 +1412,40 @@ mod tests {
     fn anthropic_resp_text_collapses_newlines_to_one_line() {
         let body = json!({"content": [{"type": "text", "text": "line1\nline2"}]});
         assert_eq!(anthropic_resp_text(&body), "line1 line2");
+    }
+
+    #[test]
+    fn chat_resp_text_keeps_tool_arguments_on_their_own_lines() {
+        // Prose is folded, but the argument string the model produced is written
+        // as it came — a multi-line payload must not be collapsed.
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "content": "line1\nline2",
+                    "tool_calls": [{
+                        "function": {"name": "bash", "arguments": "{\n\"cmd\": \"ls\"\n}"}
+                    }]
+                }
+            }]
+        });
+        assert_eq!(
+            chat_resp_text(&body),
+            "line1 line2 [tool_use: bash] {\n\"cmd\": \"ls\"\n}"
+        );
+    }
+
+    #[test]
+    fn responses_resp_text_keeps_tool_arguments_on_their_own_lines() {
+        let body = json!({
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "a\nb"}]},
+                {"type": "function_call", "name": "bash", "arguments": "{\n\"x\": 1\n}"}
+            ]
+        });
+        assert_eq!(
+            responses_resp_text(&body),
+            "a b [tool_use: bash] {\n\"x\": 1\n}"
+        );
     }
 
     #[test]
@@ -1312,19 +1485,58 @@ mod tests {
     }
 
     #[test]
+    fn chat_resp_text_renders_an_unnamed_tool_call_as_a_question_mark() {
+        // The client received a tool call, so the log records it even when the
+        // upstream never spelled the name.
+        let body = json!({
+            "choices": [{"message": {"content": null, "tool_calls": [
+                {"function": {"arguments": "{}"}},
+                {"function": {"name": "", "arguments": "{}"}}
+            ]}}]
+        });
+        assert_eq!(chat_resp_text(&body), "[tool_use: ?] {} [tool_use: ?] {}");
+    }
+
+    #[test]
+    fn anthropic_resp_text_drops_a_blank_fragment_instead_of_a_stray_separator() {
+        // An empty prose block must not leave a doubled or leading space now
+        // that the line is joined per fragment instead of folded as a whole.
+        let body = json!({
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "tool_use", "name": "bash", "input": {}},
+                {"type": "text", "text": "tail"},
+            ]
+        });
+        assert_eq!(anthropic_resp_text(&body), "[tool_use: bash] {} tail");
+    }
+
+    #[test]
     fn chat_resp_text_tool_calls_marker() {
         let body = json!({
             "choices": [{
                 "message": {
                     "content": null,
                     "tool_calls": [
-                        {"function": {"name": "bash", "arguments": "{}"}},
+                        {"function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}},
                         {"function": {"name": "read_file", "arguments": "{}"}},
                     ]
                 }
             }]
         });
-        assert_eq!(chat_resp_text(&body), "[tool_use: bash] [tool_use: read_file]");
+        assert_eq!(
+            chat_resp_text(&body),
+            "[tool_use: bash] {\"command\":\"ls\"} [tool_use: read_file] {}"
+        );
+    }
+
+    #[test]
+    fn chat_resp_text_tool_call_without_arguments_keeps_bare_marker() {
+        let body = json!({
+            "choices": [{"message": {"content": null,
+                "tool_calls": [{"function": {"name": "bash"}}]}}]
+        });
+        assert_eq!(chat_resp_text(&body), "[tool_use: bash]");
     }
 
     #[test]
@@ -1351,8 +1563,16 @@ mod tests {
         });
         assert_eq!(
             responses_resp_text(&body),
-            "answer [tool_use: get_weather] reasoning here (thinking)"
+            "answer [tool_use: get_weather] {} reasoning here (thinking)"
         );
+    }
+
+    #[test]
+    fn responses_resp_text_renders_an_unnamed_function_call_as_a_question_mark() {
+        let body = json!({
+            "output": [{"type": "function_call", "arguments": "{}"}]
+        });
+        assert_eq!(responses_resp_text(&body), "[tool_use: ?] {}");
     }
 
     #[test]
@@ -1478,16 +1698,31 @@ mod tests {
             tool_result_summary(&json!({"content": "x"})),
             "[tool_result: ?] x"
         );
-        // Non-string/array content -> "/".
+        // Non-string/array content degrades to the bare marker, not a placeholder.
         assert_eq!(
             tool_result_summary(&json!({"tool_use_id": "t_1", "content": null})),
-            "[tool_result: t_1] /"
+            "[tool_result: t_1]"
+        );
+        // A tool's output is written as it came, line breaks included.
+        assert_eq!(
+            tool_result_summary(&json!({"tool_use_id": "t_1", "content": "a\nb"})),
+            "[tool_result: t_1] a\nb"
+        );
+        assert_eq!(
+            tool_result_summary(&json!({
+                "tool_use_id": "t_1",
+                "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+            })),
+            "[tool_result: t_1] a\nb"
         );
     }
 
     #[test]
     fn extract_text_content_variants() {
-        assert_eq!(extract_text_content(Some(&json!("hello"))), "hello");
+        assert_eq!(
+            extract_text_content(Some(&json!("hello")), TextMode::Fold),
+            "hello"
+        );
 
         let blocks = json!([
             {"type": "text", "text": "a"},
@@ -1498,19 +1733,28 @@ mod tests {
             {"type": "tool_result", "tool_use_id": "t", "content": "out"}
         ]);
         assert_eq!(
-            extract_text_content(Some(&blocks)),
+            extract_text_content(Some(&blocks), TextMode::Fold),
             "a b (thinking) [image] [document] [tool_use: f] {\"x\":1} [tool_result: t] out"
         );
 
-        assert_eq!(extract_text_content(Some(&json!([]))), "[empty]");
-        assert_eq!(extract_text_content(None), "null");
-        assert_eq!(extract_text_content(Some(&Value::Null)), "null");
-        assert_eq!(extract_text_content(Some(&json!(42))), "42");
+        assert_eq!(
+            extract_text_content(Some(&json!([])), TextMode::Fold),
+            "[empty]"
+        );
+        assert_eq!(extract_text_content(None, TextMode::Fold), "null");
+        assert_eq!(
+            extract_text_content(Some(&Value::Null), TextMode::Fold),
+            "null"
+        );
+        assert_eq!(extract_text_content(Some(&json!(42)), TextMode::Fold), "42");
     }
 
     #[test]
     fn extract_openai_chat_text_variants() {
-        assert_eq!(extract_openai_chat_text(Some(&json!("hi"))), "hi");
+        assert_eq!(
+            extract_openai_chat_text(Some(&json!("hi")), TextMode::Fold),
+            "hi"
+        );
 
         let parts = json!([
             {"type": "text", "text": "a"},
@@ -1520,11 +1764,23 @@ mod tests {
             {"type": "input_image"},
             {"type": "other", "text": "ignored"}
         ]);
-        assert_eq!(extract_openai_chat_text(Some(&parts)), "a b c [image] [image]");
+        assert_eq!(
+            extract_openai_chat_text(Some(&parts), TextMode::Fold),
+            "a b c [image] [image]"
+        );
 
-        assert_eq!(extract_openai_chat_text(None), "(no content)");
-        assert_eq!(extract_openai_chat_text(Some(&Value::Null)), "(no content)");
-        assert_eq!(extract_openai_chat_text(Some(&json!([]))), "");
+        assert_eq!(
+            extract_openai_chat_text(None, TextMode::Fold),
+            "(no content)"
+        );
+        assert_eq!(
+            extract_openai_chat_text(Some(&Value::Null), TextMode::Fold),
+            "(no content)"
+        );
+        assert_eq!(
+            extract_openai_chat_text(Some(&json!([])), TextMode::Fold),
+            ""
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1656,6 +1912,148 @@ mod tests {
         });
         assert_eq!(
             request_text_for_entry(&no_user, LocalEntry::OaiResponses),
+            "(no messages)"
+        );
+    }
+
+    #[test]
+    fn request_text_keeps_anthropic_tool_result_newlines() {
+        // The `[REQ]` line folds the prompt, but the tool's own output is the
+        // tool's content, so its line breaks survive (ADR-0012).
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "read\nthat"},
+                    {"type": "tool_result", "tool_use_id": "t_1", "content": "line one\nline two"}
+                ]
+            }]
+        });
+        assert_eq!(
+            request_text(&body),
+            "read that [tool_result: t_1] line one\nline two"
+        );
+    }
+
+    #[test]
+    fn request_text_for_entry_renders_object_tool_result_as_json() {
+        // A payload that is neither text nor a content array is serialised, not
+        // described as "no content".
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "tool", "tool_call_id": "call_1", "content": {"ok": true}}
+            ]
+        });
+        assert_eq!(
+            request_text_for_entry(&body, LocalEntry::OaiChat),
+            "go | [tool_result: call_1] {\"ok\":true}"
+        );
+    }
+
+    #[test]
+    fn request_text_for_entry_appends_chat_tool_results() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "read that file"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "function": {"name": "read_file", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "line one\nline two"}
+            ]
+        });
+        assert_eq!(
+            request_text_for_entry(&body, LocalEntry::OaiChat),
+            // The tool's own output keeps the line breaks it arrived with; only
+            // the prompt side is folded onto the log line.
+            "read that file | [tool_result: call_1] line one\nline two"
+        );
+    }
+
+    #[test]
+    fn request_text_for_entry_appends_responses_tool_results() {
+        let body = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "read that file"},
+                {"type": "function_call", "call_id": "call_1", "name": "read_file",
+                 "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "contents"}
+            ]
+        });
+        assert_eq!(
+            request_text_for_entry(&body, LocalEntry::OaiResponses),
+            "read that file | [tool_result: call_1] contents"
+        );
+    }
+
+    #[test]
+    fn request_text_for_entry_ignores_tool_results_before_last_user_message() {
+        // Only the turn being answered is logged: an earlier turn's result must
+        // not reappear on a later request's line.
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "tool", "tool_call_id": "call_0", "content": "old output"},
+                {"role": "user", "content": "second"}
+            ]
+        });
+        assert_eq!(request_text_for_entry(&body, LocalEntry::OaiChat), "second");
+    }
+
+    #[test]
+    fn request_text_for_entry_tool_result_without_payload_keeps_bare_marker() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "tool", "tool_call_id": "call_1", "content": null}
+            ]
+        });
+        assert_eq!(
+            request_text_for_entry(&body, LocalEntry::OaiChat),
+            "go | [tool_result: call_1]"
+        );
+    }
+
+    #[test]
+    fn request_text_for_entry_with_only_tool_results_drops_the_separator() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": ""},
+                {"role": "tool", "tool_call_id": "call_1", "content": "out"}
+            ]
+        });
+        assert_eq!(
+            request_text_for_entry(&body, LocalEntry::OaiChat),
+            "[tool_result: call_1] out"
+        );
+    }
+
+    #[test]
+    fn request_text_for_entry_without_a_user_turn_still_shows_tool_results() {
+        let chat = json!({
+            "messages": [
+                {"role": "assistant", "content": "reply"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "out"}
+            ]
+        });
+        assert_eq!(
+            request_text_for_entry(&chat, LocalEntry::OaiChat),
+            "reply | [tool_result: call_1] out"
+        );
+
+        let responses = json!({
+            "input": [
+                {"type": "function_call_output", "call_id": "call_1", "output": "out"}
+            ]
+        });
+        assert_eq!(
+            request_text_for_entry(&responses, LocalEntry::OaiResponses),
+            "[tool_result: call_1] out"
+        );
+
+        // Nothing at all to show still falls back to the placeholder.
+        assert_eq!(
+            request_text_for_entry(&json!({"input": []}), LocalEntry::OaiResponses),
             "(no messages)"
         );
     }

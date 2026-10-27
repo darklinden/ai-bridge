@@ -51,5 +51,6 @@ cargo run   # 或 ./run.sh
 ```
 
 - **流式**：`[RESP #xxxx]: ` 一行应出现，且响应文本**实时 append 到同一行**，完成后换行。
+- **工具调用**：模型发起工具调用时，`[RESP #xxxx]` 行应出现 `[tool_use: 工具名] {参数}`（参数原样、不截断；无参数时退化为 `[tool_use: 工具名]`；上游未给名字时记为 `[tool_use: ?]`）；下一轮请求的 `[REQ #xxxx]` 行应出现 `[tool_result: id] 工具输出`。**参数或输出含换行时应原样跨行出现，不被折叠成一行**（普通正文仍在同一行）。用带工具调用的 prompt 各入口跑一遍，覆盖三种 `upstream_type`。
 - **错误**：应出现 `[ERR-REQ #xxxx]` / `[ERR-RESP #xxxx]` 标记行。
 - 覆盖三种 `upstream_type`（`anthropic-messages` / `oai-chat` / `oai-responses`）各写一份 profile 配置并分别启动，各跑一遍三个脚本，可验证全部转换矩阵；特别是 `upstream_type = "anthropic-messages"` 时三入口都应能在 `[RESP]` 行看到流式文本。

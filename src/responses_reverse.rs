@@ -357,7 +357,6 @@ where
 
     stream! {
         reqlog.resp_header("");
-        let mut resp_has_text = false;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let current_model = model;
@@ -380,6 +379,8 @@ where
         // events (real OpenAI Responses sends these too).
         let mut block_out: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
         let mut block_is_tool: std::collections::BTreeMap<usize, bool> = std::collections::BTreeMap::new();
+        // Output indices whose `[tool_use: …]` marker is already on the log line.
+        let mut logged_tools: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut msg_status: &str = "completed";
         let mut response_usage: Option<Value> = None;
 
@@ -452,9 +453,6 @@ where
                                             let name = b.get("name").and_then(Value::as_str).unwrap_or("");
                                             fc_meta.insert(tool_item_count, (id.to_string(), name.to_string()));
                                             fc_args.insert(tool_item_count, String::new());
-                                            if log_resp && !resp_has_text {
-                                                reqlog.append(&format!("[tool_use: {name}]"));
-                                            }
                                             let item = json!({
                                                 "type": "response.output_item.added",
                                                 "output_index": tool_item_count,
@@ -480,7 +478,6 @@ where
                                             let text = d.get("text").and_then(Value::as_str).unwrap_or("");
                                             text_acc.entry(content_index).or_default().push_str(text);
                                             if log_resp {
-                                                resp_has_text = true;
                                                 reqlog.append(text);
                                             }
                                             let delta = json!({
@@ -514,11 +511,28 @@ where
                                     // finalizes the tool as executable. Its arguments
                                     // are complete here (all deltas accumulated above).
                                     let oidx = block_out.get(&idx).copied().unwrap_or(idx);
+                                    // `fc_meta`/`fc_args` must survive this branch: the
+                                    // terminal `response.completed` builds its output from
+                                    // them (FR-20 — logging never alters what is forwarded),
+                                    // so only the *logging* is marked as done here.
                                     let args = fc_args.get(&oidx).cloned().unwrap_or_default();
                                     let (call_id, name) = fc_meta
                                         .get(&oidx)
                                         .cloned()
                                         .unwrap_or_else(|| ("".to_string(), "".to_string()));
+                                    // The call is complete, so the log line gets the whole
+                                    // `[tool_use: name] {arguments}` marker now. A block the
+                                    // upstream never named is rendered `[tool_use: ?]`, the
+                                    // same way the request-line extractors render one. The
+                                    // `logged_tools` check is what keeps a repeated stop
+                                    // frame (a replayed or non-conforming stream) from
+                                    // writing the same call twice.
+                                    if log_resp && logged_tools.insert(oidx) {
+                                        crate::reqlog::append_markers(
+                                            &reqlog,
+                                            [crate::reqlog::ToolCall::open(&name, &args)],
+                                        );
+                                    }
                                     let args_done = json!({
                                         "type": "response.function_call_arguments.done",
                                         "item_id": format!("fc_{}", oidx),
@@ -634,14 +648,49 @@ where
                 }
                 Err(e) => {
                     if log_resp {
+                        // `err_resp` closes the log line, so a tool call still
+                        // open has to be written before it.
+                        flush_open_tools(&fc_meta, &fc_args, &mut logged_tools, &reqlog);
                         reqlog.err_resp(&format!("Stream error: {e}"));
                     }
                     break;
                 }
             }
         }
+        // A tool block the upstream never closed still has its arguments on the
+        // log line, in output-index order. `fc_meta`/`fc_args` are read, not
+        // drained, because `response.completed` still needs them.
+        if log_resp {
+            flush_open_tools(&fc_meta, &fc_args, &mut logged_tools, &reqlog);
+        }
         reqlog.done();
     }
+}
+
+/// Write out every tool call whose block never closed, in output-index order,
+/// recording each one in `logged_tools` so a second call cannot log it twice.
+/// Called both at the natural end of a stream and on the error path — the log
+/// line ends either way, and a call that already reached the client must not
+/// vanish from the record. The value maps are read, never drained:
+/// `response.completed` is built from them (FR-20).
+fn flush_open_tools(
+    fc_meta: &std::collections::BTreeMap<usize, (String, String)>,
+    fc_args: &std::collections::BTreeMap<usize, String>,
+    logged_tools: &mut std::collections::HashSet<usize>,
+    reqlog: &crate::reqlog::ReqLog,
+) {
+    let pending: Vec<(usize, crate::reqlog::ToolCall)> = fc_meta
+        .iter()
+        .filter(|(oidx, _)| !logged_tools.contains(oidx))
+        .map(|(oidx, (_, name))| {
+            let args = fc_args.get(oidx).cloned().unwrap_or_default();
+            (*oidx, crate::reqlog::ToolCall::open(name, &args))
+        })
+        .collect();
+    for (oidx, _) in &pending {
+        logged_tools.insert(*oidx);
+    }
+    crate::reqlog::append_markers(reqlog, pending.into_iter().map(|(_, call)| call));
 }
 
 /// Format a `event: <name>\ndata: <json>\n\n` SSE block.
@@ -690,6 +739,20 @@ mod tests {
                 Some((ev, serde_json::from_str(&data).unwrap_or(Value::Null)))
             })
             .collect()
+    }
+
+    /// Same drive as `run_responses_sse`, but returns the assembled `[RESP]` log
+    /// line so the logging side can be asserted.
+    async fn run_responses_sse_logged(frames: Vec<String>, log_resp: bool) -> String {
+        let upstream = futures::stream::iter(
+            frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
+        let (reqlog, captured) = ReqLog::captured();
+        let out =
+            anthropic_to_responses_sse(upstream, "gpt-5".to_string(), reqlog, log_resp);
+        let _chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let logged = captured.lock().unwrap().clone();
+        logged
     }
 
     #[test]
@@ -867,5 +930,76 @@ mod tests {
         assert_eq!(fc_done["item"]["name"], "get_weather");
         assert_eq!(fc_done["item"]["arguments"], "{\"city\":\"tokyo\"}");
         assert_eq!(fc_done["item"]["status"], "completed");
+
+        // The terminal `response.completed` mirrors the whole reply, tool call
+        // included — regression guard for a log-side change that drained the
+        // maps this event is built from.
+        let completed = out
+            .iter()
+            .find(|(e, _)| e == "response.completed")
+            .map(|(_, v)| v.clone())
+            .expect("response.completed emitted");
+        let fc_in_completed = completed["response"]["output"]
+            .as_array()
+            .expect("output array")
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function_call present in response.completed.output");
+        assert_eq!(fc_in_completed["call_id"], "t_1");
+        assert_eq!(fc_in_completed["name"], "get_weather");
+        assert_eq!(fc_in_completed["arguments"], "{\"city\":\"tokyo\"}");
+    }
+
+    #[tokio::test]
+    async fn responses_sse_logs_tool_use_with_the_whole_arguments() {
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"get_weather\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"tokyo\\\"}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ];
+        let logged = run_responses_sse_logged(frames, true).await;
+        assert!(
+            logged.contains("[tool_use: get_weather] {\"city\":\"tokyo\"}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_sse_writes_a_repeated_tool_stop_only_once() {
+        // A replayed or non-conforming stream can repeat the stop frame; the
+        // call must still reach the log exactly once.
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ];
+        let logged = run_responses_sse_logged(frames, true).await;
+        assert_eq!(
+            logged.matches("[tool_use: f] {}").count(),
+            1,
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_sse_logs_tool_use_left_open_by_a_truncated_stream() {
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n".to_string(),
+        ];
+        let logged = run_responses_sse_logged(frames, true).await;
+        assert!(logged.contains("[tool_use: f] {}"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn responses_sse_inner_wrapper_of_a_double_bridge_logs_nothing() {
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ];
+        let logged = run_responses_sse_logged(frames, false).await;
+        assert!(!logged.contains("[tool_use"), "log was: {logged}");
     }
 }

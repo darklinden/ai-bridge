@@ -75,4 +75,4 @@ Nothing below depends on anything above; the cross-cutting modules are used *by*
 - Binds `127.0.0.1` by default; exposing the proxy requires an explicit `listen_addr = "0.0.0.0"` (ADR-0005, ADR-0008).
 - Serves exactly one profile per process; profile selection and persistence are described in ADR-0006 and ADR-0007.
 - Logs to stdout by default, or simultaneously to stdout and a file with `--log <path>`; no telemetry endpoint. The CLI surface is hand-rolled, so a new option is a parser change, not a library one.
-- Tests are inline `#[cfg(test)] mod tests`; there is no `tests/` directory. `error.rs` and `reqlog.rs` carry the least unit coverage; routing and streaming are end-to-end surfaces, so changes there are checked with the `manual-test/` scripts rather than by unit tests alone.
+- Tests are inline `#[cfg(test)] mod tests`; there is no `tests/` directory. `error.rs` carries the least unit coverage; routing and streaming are end-to-end surfaces, so changes there are checked with the `manual-test/` scripts rather than by unit tests alone.

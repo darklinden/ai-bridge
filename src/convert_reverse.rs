@@ -568,13 +568,15 @@ where
 
     stream! {
         reqlog.resp_header("");
-        let mut resp_has_text = false;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut chunk_id = 0u32;
         let current_model = model;
         let mut tool_index: usize = 0;
-        let mut open_tool_ids: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
+        // Open tool blocks, keyed by their Anthropic content index. The `[RESP]`
+        // marker is written when the block closes, once its arguments are whole.
+        let mut open_tools: std::collections::HashMap<usize, crate::reqlog::ToolCall> =
+            std::collections::HashMap::new();
         let mut usage_sent = false;
 
         tokio::pin!(stream);
@@ -627,8 +629,12 @@ where
                                         Some("tool_use") => {
                                             let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
                                             let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                                            if log_resp && !resp_has_text {
-                                                reqlog.append(&format!("[tool_use: {name}]"));
+                                            // A block the upstream never named is tracked
+                                            // too: the client receives the same nameless
+                                            // block, and the log renders it `[tool_use: ?]`
+                                            // rather than hiding the call.
+                                            if log_resp {
+                                                open_tools.insert(idx, crate::reqlog::ToolCall::open(&name, ""));
                                             }
                                             tool_index = idx;
                                             let chunk = json!({
@@ -650,20 +656,17 @@ where
                                             });
                                             chunk_id += 1;
                                             yield Ok(Bytes::from(sse_chunk(&chunk)));
-                                            open_tool_ids.push((id, name, String::new()));
                                         }
                                         _ => {}
                                     }
                                 }
                             }
                             "content_block_delta" => {
-                                let _idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                                 if let Some(d) = ev.get("delta") {
                                     match d.get("type").and_then(Value::as_str) {
                                         Some("text_delta") => {
                                             let text = d.get("text").and_then(Value::as_str).unwrap_or("");
                                             if log_resp {
-                                                resp_has_text = true;
                                                 reqlog.append(text);
                                             }
                                             let chunk = json!({
@@ -700,6 +703,25 @@ where
                                         Some("input_json_delta") => {
                                             // tool arguments delta
                                             let partial = d.get("partial_json").and_then(Value::as_str).unwrap_or("");
+                                            // Accumulate against the block the emitted chunk
+                                            // below names, so the log records the arguments
+                                            // against the same call the client receives them
+                                            // for. `content_block_start` sets `tool_index` to
+                                            // the block it opens, so a conforming stream has
+                                            // the two equal; a delta naming a block the
+                                            // upstream never opened lands on the last opened
+                                            // one — again exactly what the client is told.
+                                            //
+                                            // With no block open at all, the client is still
+                                            // handed the delta (tagged index 0), so the log
+                                            // opens an unnamed call for it rather than
+                                            // dropping what the client received.
+                                            if log_resp {
+                                                open_tools
+                                                    .entry(tool_index)
+                                                    .or_default()
+                                                    .push_args(partial);
+                                            }
                                             let chunk = json!({
                                                 "id": format!("chatcmpl-{}", chunk_id),
                                                 "object": "chat.completion.chunk",
@@ -723,7 +745,15 @@ where
                                 }
                             }
                             "content_block_stop" => {
-                                // no-op
+                                // The tool block is complete, so its arguments are whole.
+                                // The stop names the block that ended, which is the key its
+                                // arguments were accumulated under in a conforming stream.
+                                let idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                                if log_resp {
+                                    if let Some(tool) = open_tools.remove(&idx) {
+                                        reqlog.append(&tool.marker());
+                                    }
+                                }
                             }
                             "message_delta" => {
                                 // stop_reason → finish_reason
@@ -764,11 +794,19 @@ where
                 Err(e) => {
                     // terminate stream on upstream error
                     if log_resp {
+                        // `err_resp` closes the log line, so a tool call still
+                        // open has to be written before it.
+                        crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
                         reqlog.err_resp(&format!("Stream error: {e}"));
                     }
                     break;
                 }
             }
+        }
+        // A tool block the upstream never closed still has its arguments on the
+        // log line, in content-index order.
+        if log_resp {
+            crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
         }
         reqlog.done();
     }
@@ -805,6 +843,17 @@ mod tests {
                 serde_json::from_str(data.trim()).ok()
             })
             .collect()
+    }
+
+    /// Same drive as `run_chat_sse`, but returns the assembled `[RESP]` log line.
+    async fn run_chat_sse_logged(frames: Vec<String>, log_resp: bool) -> String {
+        let upstream =
+            futures::stream::iter(frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))));
+        let (reqlog, captured) = ReqLog::captured();
+        let out = anthropic_to_chat_sse(upstream, "gpt-5".to_string(), reqlog, log_resp);
+        let _chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let logged = captured.lock().unwrap().clone();
+        logged
     }
 
     #[test]
@@ -1035,5 +1084,177 @@ mod tests {
             .filter_map(|v| v.pointer("/choices/0/finish_reason").and_then(Value::as_str))
             .collect();
         assert_eq!(finishes, vec!["tool_calls"]);
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_tool_use_with_the_whole_arguments() {
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"get_weather\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"tokyo\\\"}\"}}\n\n".to_string(),
+            // No content_block_stop: the end-of-stream flush must still write it.
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ];
+        let logged = run_chat_sse_logged(frames, true).await;
+        assert!(
+            logged.contains("[tool_use: get_weather] {\"city\":\"tokyo\"}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_tool_use_when_the_block_closes() {
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ];
+        let logged = run_chat_sse_logged(frames, true).await;
+        assert!(logged.contains("[tool_use: f] {}"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_text_then_tool_use_without_suppressing_it() {
+        // The old `resp_has_text` rule dropped a tool call that followed text.
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me look.\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n".to_string(),
+        ];
+        let logged = run_chat_sse_logged(frames, true).await;
+        assert!(logged.contains("Let me look."), "log was: {logged}");
+        assert!(logged.contains("[tool_use: f]"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn chat_sse_inner_wrapper_of_a_double_bridge_logs_nothing() {
+        // `log_resp == false` means an inner stream already logs this request.
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ];
+        let logged = run_chat_sse_logged(frames, false).await;
+        assert!(!logged.contains("[tool_use"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_parallel_tool_calls_independently() {
+        // Same tool twice: keying per block (not by name) is what keeps the
+        // second call visible, and each keeps its own arguments.
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"read\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"p\\\":\\\"a\\\"}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_2\",\"name\":\"read\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"p\\\":\\\"b\\\"}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n".to_string(),
+        ];
+        let logged = run_chat_sse_logged(frames, true).await;
+        assert!(
+            logged.contains("[tool_use: read] {\"p\":\"a\"}"),
+            "log was: {logged}"
+        );
+        assert!(
+            logged.contains("[tool_use: read] {\"p\":\"b\"}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_arguments_against_the_call_the_client_is_told_about() {
+        // The upstream opens both tool blocks up front, so when block 0's
+        // arguments arrive `tool_index` already names block 1. The forwarded
+        // chunk is tagged with `tool_index`, so the log records the arguments
+        // against that same call — the record and the client must not disagree
+        // about which call received which input.
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"first\"}}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_2\",\"name\":\"second\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ];
+
+        let forwarded = run_chat_sse(frames.clone(), true).await;
+        let mut arg_index = None;
+        for value in &forwarded {
+            let Some(call) = value.pointer("/choices/0/delta/tool_calls/0") else {
+                continue;
+            };
+            if call.pointer("/function/arguments").and_then(Value::as_str) == Some("{\"a\":1}") {
+                arg_index = call.get("index").and_then(Value::as_u64);
+            }
+        }
+        assert_eq!(arg_index, Some(1), "forwarded was: {forwarded:?}");
+
+        let logged = run_chat_sse_logged(frames, true).await;
+        assert!(
+            logged.contains("[tool_use: second] {\"a\":1}"),
+            "log was: {logged}"
+        );
+        assert!(logged.contains("[tool_use: first]"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn chat_sse_writes_a_delta_for_an_unopened_block_at_that_blocks_stop() {
+        // A non-conforming upstream names a block it never opened. The forwarded
+        // chunk is tagged with the last opened block, so the log attributes the
+        // arguments there and writes them when *that* block stops — not at the
+        // end of the stream, after whatever text follows it.
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":5,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"after\"}}\n\n".to_string(),
+        ];
+        let logged = run_chat_sse_logged(frames, true).await;
+        let marker = logged
+            .find("[tool_use: f] {\"a\":1}")
+            .unwrap_or_else(|| panic!("log was: {logged}"));
+        let text = logged
+            .find("after")
+            .unwrap_or_else(|| panic!("log was: {logged}"));
+        assert!(marker < text, "marker must precede later text: {logged}");
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_a_delta_that_names_no_open_block_as_an_unnamed_call() {
+        // The client is still handed this delta (tagged index 0), so the log
+        // must not drop it even though the upstream never opened a block.
+        let frames = vec![
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}\n\n".to_string(),
+        ];
+        let logged = run_chat_sse_logged(frames, true).await;
+        assert!(
+            logged.contains("[tool_use: ?] {\"a\":1}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_writes_open_tool_calls_before_the_error_line() {
+        let frames: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"bash\"}}\n\n",
+            )),
+            Ok(Bytes::from(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            )),
+            Err(std::io::Error::other("boom")),
+        ];
+        let (reqlog, captured) = ReqLog::captured();
+        let upstream = futures::stream::iter(frames);
+        let out = anthropic_to_chat_sse(upstream, "gpt-5".to_string(), reqlog, true);
+        let _: Vec<_> = out.collect().await;
+
+        let logged = captured.lock().unwrap().clone();
+        let marker = logged.find("[tool_use: bash] {}");
+        let error = logged.find("[ERR-RESP");
+        assert!(marker.is_some(), "log was: {logged}");
+        assert!(error.is_some(), "log was: {logged}");
+        assert!(marker < error, "marker must precede the error line: {logged}");
     }
 }

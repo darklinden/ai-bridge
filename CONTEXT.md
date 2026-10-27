@@ -23,7 +23,7 @@ _Avoid_: 直通, proxy mode, raw mode
 _Avoid_: config file, env, 环境变量
 
 **Request log**:
-进程内单行流日志，一次请求/响应对应四类行：`[REQ SYSTEM]`（system prompt 变化时才打印）、`[REQ #id]`、`[RESP #id]`（流式文本追加在同一条未闭合的行上）、以及错误时的 `[ERR-REQ #id]` / `[ERR-RESP #id]`。与 `RUST_LOG` 无关，始终开启；正文一律原样记录（含 base64 媒体载荷），不做摘要。默认只写 stdout；给出 `--log <path>` 时同一份内容 **tee** 到该文件（stdout 照写），文件以追加方式打开、由使用者自行轮转（ADR-0012）。
+进程内行式流日志，一次请求/响应对应四类行：`[REQ SYSTEM]`（system prompt 变化时才打印）、`[REQ #id]`、`[RESP #id]`（流式文本追加在同一条未闭合的行上）、以及错误时的 `[ERR-REQ #id]` / `[ERR-RESP #id]`。与 `RUST_LOG` 无关，始终开启；正文一律原样记录（含 base64 媒体载荷），不做摘要。工具调用是这些行的一部分，用统一词表 `[tool_use: 名字] {参数}` / `[tool_result: id] {内容}` 记录（参数同样原样、不截断，**含换行**；普通正文仍折叠在同一行，故一条记录可跨多行；未命名工具记为 `[tool_use: ?]`）：`tool_use` 在工具块结束时写出（参数 delta 到齐才有完整值），且**始终**记录，不因正文先出现而省略；`tool_result` 写在 `[REQ #id]` 行上。默认只写 stdout；给出 `--log <path>` 时同一份内容 **tee** 到该文件（stdout 照写），文件以追加方式打开、由使用者自行轮转（ADR-0012）。
 _Avoid_: 日志服务, log file, telemetry, debug log
 
 **Media description**:

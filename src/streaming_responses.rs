@@ -112,7 +112,6 @@ where
 {
     stream! {
         reqlog.resp_header("");
-        let mut resp_has_text = false;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
 
@@ -133,8 +132,10 @@ where
 
         // Tool tracking
         let mut tool_index_by_item_id: HashMap<String, u32> = HashMap::new();
-        let mut tool_name_by_index: HashMap<u32, String> = HashMap::new();
-        let mut tool_args_by_index: HashMap<u32, String> = HashMap::new();
+        // Open function_call blocks, keyed by their Anthropic content index. The
+        // `[RESP]` marker is written when the block closes, once its arguments
+        // are whole.
+        let mut open_tools: HashMap<u32, crate::reqlog::ToolCall> = HashMap::new();
 
         // Reasoning tracking
         let mut reasoning_index_by_item_id: HashMap<String, u32> = HashMap::new();
@@ -308,7 +309,6 @@ where
                                             "event: content_block_delta\ndata: {}\n\n",
                                             serde_json::to_string(&event).unwrap_or_default()
                                         );
-                                        resp_has_text = true;
                                         reqlog.append(delta);
                                         yield Ok(Bytes::from(sse_data));
                                     }
@@ -407,8 +407,11 @@ where
                                         let index = next_content_index;
                                         next_content_index += 1;
                                         tool_index_by_item_id.insert(item_id, index);
-                                        tool_name_by_index.insert(index, name.clone());
-                                        tool_args_by_index.insert(index, String::new());
+                                        // A block the upstream never named is
+                                        // still tracked: the client receives the
+                                        // same nameless block, so the log records
+                                        // it as `[tool_use: ?]` rather than hiding it.
+                                        open_tools.insert(index, crate::reqlog::ToolCall::open(&name, ""));
 
                                         let event = json!({
                                             "type": "content_block_start",
@@ -424,9 +427,6 @@ where
                                             serde_json::to_string(&event).unwrap_or_default()
                                         );
                                         open_indices.insert(index);
-                                        if !resp_has_text {
-                                            reqlog.append(&format!("[tool_use: {name}]"));
-                                        }
                                         yield Ok(Bytes::from(sse_data));
                                     }
                                     "reasoning" => {
@@ -500,11 +500,11 @@ where
                                 if let Some(delta) = json_data.get("delta").and_then(|v| v.as_str()) {
                                     if let Some(&index) = tool_index_by_item_id.get(item_id) {
                                         // Append to accumulated args
-                                        let args = tool_args_by_index.entry(index).or_default();
-                                        args.push_str(delta);
+                                        let tool = open_tools.entry(index).or_default();
+                                        tool.push_args(delta);
 
                                         // Infinite whitespace detection
-                                        if args.len() > args.trim_end().len() + INFINITE_WHITESPACE_THRESHOLD {
+                                        if tool.args.len() > tool.args.trim_end().len() + INFINITE_WHITESPACE_THRESHOLD {
                                             warn!(
                                                 "Detected infinite whitespace bug (tool index: {index}), aborting"
                                             );
@@ -531,6 +531,31 @@ where
                         }
 
                         // ==========================================================
+                        // response.function_call_arguments.done
+                        // ==========================================================
+                        // Carries the whole argument string. The forwarded stream
+                        // only relays deltas, but the log must not show a bare
+                        // marker just because the deltas never came.
+                        if event_type == "response.function_call_arguments.done" {
+                            if let Ok(json_data) = serde_json::from_str::<Value>(&data) {
+                                let item_id = json_data
+                                    .get("item_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                if let Some(args) =
+                                    json_data.get("arguments").and_then(Value::as_str)
+                                {
+                                    if let Some(&index) = tool_index_by_item_id.get(item_id) {
+                                        if let Some(tool) = open_tools.get_mut(&index) {
+                                            tool.resolve_args(args);
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // ==========================================================
                         // response.output_item.done
                         // ==========================================================
                         if event_type == "response.output_item.done" {
@@ -546,6 +571,23 @@ where
                                 match item_type {
                                     "function_call" => {
                                         if let Some(&index) = tool_index_by_item_id.get(item_id) {
+                                            // The call is complete: its arguments are whole, so
+                                            // the log line gets the full marker now. The item's
+                                            // own `arguments` covers an upstream that never sent
+                                            // them as deltas (the forwarded stream drops those
+                                            // either way; the log mirrors what the upstream sent).
+                                            if let Some(tool) = open_tools.get_mut(&index) {
+                                                if let Some(args) =
+                                                    item.get("arguments").and_then(Value::as_str)
+                                                {
+                                                    tool.resolve_args(args);
+                                                }
+                                            }
+                                            if let Some(marker) =
+                                                open_tools.remove(&index).map(|tool| tool.marker())
+                                            {
+                                                reqlog.append(&marker);
+                                            }
                                             let event = json!({
                                                 "type": "content_block_stop",
                                                 "index": index
@@ -621,6 +663,13 @@ where
                                 let mut open_sorted: Vec<u32> = open_indices.iter().copied().collect();
                                 open_sorted.sort_unstable();
                                 for index in open_sorted {
+                                    // A tool block that never got its own
+                                    // `output_item.done` still has a complete call.
+                                    if let Some(marker) =
+                                        open_tools.remove(&index).map(|tool| tool.marker())
+                                    {
+                                        reqlog.append(&marker);
+                                    }
                                     let event = json!({
                                         "type": "content_block_stop",
                                         "index": index
@@ -679,6 +728,9 @@ where
                                 serde_json::to_string(&error_event).unwrap_or_default()
                             );
                             yield Ok(Bytes::from(sse_data));
+                            // `err_resp` closes the log line, so a tool call
+                            // still open has to be written before it.
+                            crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
                             reqlog.err_resp(&error_msg);
                             break;
                         }
@@ -699,6 +751,7 @@ where
                         serde_json::to_string(&error_event).unwrap_or_default()
                     );
                     yield Ok(Bytes::from(sse_data));
+                    crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
                     reqlog.err_resp(&format!("Stream error: {e}"));
                     break;
                 }
@@ -749,6 +802,9 @@ where
                     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string();
                 yield Ok(Bytes::from(sse_data));
             }
+
+            // Safety net for a stream that ended without finalising its tools.
+            crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
 
             reqlog.done();
         }
@@ -883,6 +939,21 @@ mod tests {
                 (ev, serde_json::from_str(&data).unwrap_or(Value::Null))
             })
             .collect()
+    }
+
+    /// Like `run`, but returns the assembled `[RESP]` log line so the logging
+    /// side can be asserted alongside the forwarded events.
+    async fn run_logged(frames: Vec<String>) -> String {
+        let upstream = futures::stream::iter(
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
+        let (reqlog, captured) = ReqLog::captured();
+        let out = responses_to_anthropic_sse(upstream, "gpt-4o".to_string(), reqlog);
+        let _chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let logged = captured.lock().unwrap().clone();
+        logged
     }
 
     /// Like `run`, but lets a test inject an `Err` chunk mid-stream.
@@ -1533,5 +1604,123 @@ mod tests {
         assert_eq!(result["output_tokens"], 20);
         assert!(result.get("cache_read_input_tokens").is_none());
         assert!(result.get("cache_creation_input_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn logs_tool_use_with_the_whole_arguments_at_output_item_done() {
+        let logged = run_logged(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather"}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"city\":\""}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "Paris\"}"}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "function_call", "id": "fc_1"}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+        assert!(
+            logged.contains("[tool_use: get_weather] {\"city\":\"Paris\"}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_tool_use_left_open_when_the_stream_just_stops() {
+        // No `output_item.done` and no `response.completed`: the end-of-stream
+        // flush must still write the call.
+        let logged = run_logged(vec![
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "f"}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{}"}),
+            ),
+        ])
+        .await;
+        assert!(logged.contains("[tool_use: f] {}"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn logs_arguments_that_only_arrive_in_the_done_frame() {
+        // The forwarded stream relays deltas only, but the log mirrors what the
+        // upstream sent — including a call whose arguments came in the terminal
+        // `function_call_arguments.done` frame.
+        let logged = run_logged(vec![
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "f"}),
+            ),
+            sse_block(
+                "response.function_call_arguments.done",
+                &json!({"type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": "{\"a\":1}"}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "function_call", "id": "fc_1"}),
+            ),
+        ])
+        .await;
+        assert!(logged.contains("[tool_use: f] {\"a\":1}"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn logs_a_question_mark_for_a_tool_the_upstream_never_named() {
+        // The argument deltas still create tracker state (the whitespace guard
+        // reads it), and the client receives the same nameless block — so the
+        // call is recorded as `[tool_use: ?]` rather than vanishing.
+        let logged = run_logged(vec![
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": ""}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{}"}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "function_call", "id": "fc_1"}),
+            ),
+        ])
+        .await;
+        assert!(logged.contains("[tool_use: ?] {}"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn logs_tool_use_that_response_completed_closes() {
+        // No `output_item.done` for the tool: the `response.completed` sweep is
+        // what closes the block, and the call must still reach the log.
+        let logged = run_logged(vec![
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "f"}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{}"}),
+            ),
+            sse_block(
+                "response.completed",
+                &json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+            ),
+        ])
+        .await;
+        assert!(logged.contains("[tool_use: f] {}"), "log was: {logged}");
     }
 }

@@ -880,6 +880,14 @@ struct ToolBlockState {
     aborted: bool,
 }
 
+/// A tool block that is open on the wire and still accumulating arguments.
+///
+/// The `[RESP]` line cannot be written when the block opens — the arguments only
+/// arrive as later deltas — so the name and the accumulated JSON wait here until
+/// the block closes. The flush itself lives in [`crate::reqlog::flush_open_tools`],
+/// shared with the other streaming paths.
+type OpenTool = crate::reqlog::ToolCall;
+
 /// Convert OpenAI Chat SSE stream to Anthropic SSE stream.
 ///
 /// Wraps the upstream streaming response and translates each SSE chunk from
@@ -897,7 +905,6 @@ where
 {
     stream! {
         reqlog.resp_header("");
-        let mut resp_has_text = false;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut next_content_index: u32 = 0;
@@ -916,7 +923,7 @@ where
         // Monotonic id source for synthetic reasoning items in signatures.
         let mut reasoning_sequence: u64 = 0;
         let mut tool_blocks_by_index: std::collections::HashMap<usize, ToolBlockState> = std::collections::HashMap::new();
-        let mut open_tool_block_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut open_tools: std::collections::HashMap<u32, OpenTool> = std::collections::HashMap::new();
         let mut has_sent_message_stop = false;
         let mut stream_ended_with_error = false;
 
@@ -1131,7 +1138,6 @@ where
                                                         "event: content_block_delta\ndata: {}\n\n",
                                                         serde_json::to_string(&event).unwrap_or_default()
                                                     );
-                                                    resp_has_text = true;
                                                     reqlog.append(content);
                                                     yield Ok(Bytes::from(sse_data));
                                                 }
@@ -1239,6 +1245,19 @@ where
                                                     };
 
                                                     if should_start {
+                                                        // Arguments may already have arrived before
+                                                        // the block could open; fold them in so the
+                                                        // log gets the whole call at close time.
+                                                        open_tools.insert(
+                                                            anthropic_index,
+                                                            OpenTool::open(
+                                                                &name,
+                                                                pending_after_start
+                                                                    .as_deref()
+                                                                    .unwrap_or(""),
+                                                            ),
+                                                        );
+
                                                         let event = json!({
                                                             "type": "content_block_start",
                                                             "index": anthropic_index,
@@ -1252,10 +1271,6 @@ where
                                                             "event: content_block_start\ndata: {}\n\n",
                                                             serde_json::to_string(&event).unwrap_or_default()
                                                         );
-                                                        open_tool_block_indices.insert(anthropic_index);
-                                                        if !resp_has_text {
-                                                            reqlog.append(&format!("[tool_use: {name}]"));
-                                                        }
                                                         yield Ok(Bytes::from(sse_data));
                                                     }
 
@@ -1273,6 +1288,12 @@ where
                                                             serde_json::to_string(&event).unwrap_or_default()
                                                         );
                                                         yield Ok(Bytes::from(sse_data));
+                                                    }
+
+                                                    if let Some(args) = &immediate_delta {
+                                                        if let Some(open) = open_tools.get_mut(&anthropic_index) {
+                                                            open.push_args(args);
+                                                        }
                                                     }
 
                                                     if let Some(args) = immediate_delta {
@@ -1360,7 +1381,12 @@ where
                                                 late_tool_starts.push((state.anthropic_index, fallback_id, fallback_name, pending));
                                             }
                                             late_tool_starts.sort_unstable_by_key(|(index, _, _, _)| *index);
-                                            for (index, id, name, _pending) in late_tool_starts {
+                                            for (index, id, name, pending) in late_tool_starts {
+                                                // The block only becomes openable now; the
+                                                // arguments buffered before this point are the
+                                                // model's actual input, so the log keeps them
+                                                // even though the emitted stream drops them.
+                                                open_tools.insert(index, OpenTool::open(&name, &pending));
                                                 let event = json!({
                                                     "type": "content_block_start",
                                                     "index": index,
@@ -1374,17 +1400,17 @@ where
                                                     "event: content_block_start\ndata: {}\n\n",
                                                     serde_json::to_string(&event).unwrap_or_default()
                                                 );
-                                                open_tool_block_indices.insert(index);
-                                                if !resp_has_text {
-                                                    reqlog.append(&format!("[tool_use: {name}]"));
-                                                }
                                                 yield Ok(Bytes::from(sse_data));
                                             }
 
-                                            // Close tool blocks
-                                            let mut tool_indices: Vec<u32> = open_tool_block_indices.iter().copied().collect();
+                                            // Close tool blocks, writing each call's complete
+                                            // `[tool_use: name] {arguments}` onto the log line.
+                                            let mut tool_indices: Vec<u32> = open_tools.keys().copied().collect();
                                             tool_indices.sort_unstable();
                                             for index in tool_indices {
+                                                if let Some(tool) = open_tools.remove(&index) {
+                                                    reqlog.append(&tool.marker());
+                                                }
                                                 let event = json!({
                                                     "type": "content_block_stop",
                                                     "index": index
@@ -1393,7 +1419,6 @@ where
                                                     "event: content_block_stop\ndata: {}\n\n",
                                                     serde_json::to_string(&event).unwrap_or_default()
                                                 );
-                                                open_tool_block_indices.remove(&index);
                                                 yield Ok(Bytes::from(sse_data));
                                             }
 
@@ -1421,6 +1446,9 @@ where
                         serde_json::to_string(&error_event).unwrap_or_default()
                     );
                     yield Ok(Bytes::from(sse_data));
+                    // `err_resp` closes the log line, so a tool call still open
+                    // has to be written before it.
+                    crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
                     reqlog.err_resp(&format!("Stream error: {e}"));
                     break;
                 }
@@ -1469,6 +1497,10 @@ where
                     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string();
                 yield Ok(Bytes::from(sse_data));
             }
+
+            // An upstream that ended without a finish_reason leaves tool blocks
+            // open; their calls still belong on the log line.
+            crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
 
             reqlog.done();
         }
@@ -1748,6 +1780,52 @@ mod tests {
         events.iter().map(|(e, _)| e.as_str()).collect()
     }
 
+    /// Same drive as `run`, but returns the assembled `[RESP]` log line so the
+    /// logging side of the conversion can be asserted (the SSE assertions above
+    /// only cover the forwarded bytes).
+    async fn run_logged(frames: Vec<&'static str>) -> String {
+        let upstream = futures::stream::iter(
+            frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
+        let (reqlog, captured) = ReqLog::captured();
+        let out = chat_to_anthropic_sse(upstream, "claude-sonnet-5".to_string(), reqlog);
+        let _chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let logged = captured.lock().unwrap().clone();
+        logged
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_tool_use_with_the_whole_arguments() {
+        let logged = run_logged(vec![
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"SF\\\"}\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        assert!(
+            logged.contains("[tool_use: get_weather] {\"city\":\"SF\"}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_text_then_tool_use_without_suppressing_it() {
+        // The old `resp_has_text` rule dropped a tool call that followed text.
+        let logged = run_logged(vec![
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Let me look.\"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        assert!(logged.contains("Let me look."), "log was: {logged}");
+        assert!(
+            logged.contains("[tool_use: bash] {}"),
+            "log was: {logged}"
+        );
+    }
+
     #[test]
     fn openai_refusal_finish_maps_to_refusal_stop() {
         let body = json!({
@@ -1889,6 +1967,55 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_a_tool_left_open_when_the_stream_just_stops() {
+        // No `finish_reason` ever arrives, so the tool block never closes; the
+        // end-of-stream flush must still write the call.
+        let logged = run_logged(vec![
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        ])
+        .await;
+        assert!(logged.contains("[tool_use: bash] {}"), "log was: {logged}");
+    }
+
+    #[tokio::test]
+    async fn chat_sse_logs_a_tool_whose_name_only_arrives_at_finish_reason() {
+        // The block only becomes openable in the terminal chunk, so this is the
+        // `late_tool_starts` path — the one place the buffered arguments are
+        // read rather than forwarded.
+        let logged = run_logged(vec![
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        assert!(
+            logged.contains("[tool_use: unknown_tool] {\"a\":1}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_writes_open_tool_calls_before_the_error_line() {
+        // `err_resp` closes the log line, so the call has to precede it.
+        let frames: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(
+                "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            )),
+            Err(std::io::Error::other("boom")),
+        ];
+        let (reqlog, captured) = ReqLog::captured();
+        let upstream = futures::stream::iter(frames);
+        let out = chat_to_anthropic_sse(upstream, "claude-sonnet-5".to_string(), reqlog);
+        let _: Vec<_> = out.collect().await;
+
+        let logged = captured.lock().unwrap().clone();
+        let marker = logged.find("[tool_use: bash] {\"command\":\"ls\"}");
+        let error = logged.find("[ERR-RESP");
+        assert!(marker.is_some(), "log was: {logged}");
+        assert!(error.is_some(), "log was: {logged}");
+        assert!(marker < error, "marker must precede the error line: {logged}");
     }
 
     #[tokio::test]
