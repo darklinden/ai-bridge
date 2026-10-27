@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 /// → `<name>.toml`), or for a bare `ai-bridge` launch by the recorded
 /// last-served profile in `.settings.toml` (ADR-0006/0007), falling back to
 /// `default.toml` when no selection is recorded. The former `UPSTREAM_*` /
-/// `VISION_*` / `LISTEN_*` environment variables are gone; only `RUST_LOG`
-/// is still read from the environment (tracing convention).
+/// `VISION_*` / `LISTEN_*` environment variables are gone; no configuration
+/// *value* is read from the environment, `RUST_LOG` (tracing convention) being
+/// the one exception. The config directory is located by the platform, not
+/// configured — see [`home_config_dir`] and ADR-0005.
 pub(crate) const CONFIG_DIR_NAME: &str = ".ai-bridge";
 pub(crate) const DEFAULT_PROFILE: &str = "default";
 
@@ -116,18 +118,28 @@ pub(crate) struct LoadedProfile {
     pub(crate) config: Config,
 }
 
-/// Resolve `$HOME/.ai-bridge`, where all profile TOMLs live.
+/// Error text for "no home directory": both the platform's own variable and
+/// its fallback lookup came up empty. Deliberately platform-neutral — naming
+/// `HOME` would be wrong on Windows, where it is never consulted.
+const NO_HOME_MSG: &str = "Could not determine the home directory; cannot resolve ~/.ai-bridge";
+
+/// Resolve `<home>/.ai-bridge`, where all profile TOMLs live. The home
+/// directory is the platform's own ([`std::env::home_dir`]) — see ADR-0005 for
+/// why Windows must not read `HOME`.
 pub(crate) fn home_config_dir() -> Result<PathBuf, Error> {
-    config_dir(std::env::var("HOME").ok().as_deref())
+    config_dir(std::env::home_dir().as_deref())
 }
 
-/// Injected variant of [`home_config_dir`] so tests never mutate `$HOME`.
-fn config_dir(home: Option<&str>) -> Result<PathBuf, Error> {
-    match home.map(str::trim).filter(|h| !h.is_empty()) {
-        Some(home) => Ok(Path::new(home).join(CONFIG_DIR_NAME)),
-        None => Err(Error::Config(
-            "HOME environment variable is not set; cannot resolve ~/.ai-bridge".into(),
-        )),
+/// Injected variant of [`home_config_dir`] so tests never mutate the process
+/// environment. A blank home counts as absent: joining it would put
+/// `.ai-bridge` in the current directory. A non-blank home is used verbatim,
+/// whitespace included — it is a platform-provided path, not a typed value.
+fn config_dir(home: Option<&Path>) -> Result<PathBuf, Error> {
+    // Only a UTF-8 home can be judged blank; a non-UTF-8 path is kept.
+    let home = home.filter(|h| !h.as_os_str().to_str().is_some_and(|s| s.trim().is_empty()));
+    match home {
+        Some(home) => Ok(home.join(CONFIG_DIR_NAME)),
+        None => Err(Error::Config(NO_HOME_MSG.into())),
     }
 }
 
@@ -452,8 +464,8 @@ fn build_vision_config(raw: RawVision) -> Option<VisionConfig> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_vision_config, config_dir, current_profile, list_profiles, load_profile,
-        profile_path, resolve_bare_profile, save_current_profile, settings_path,
+        build_vision_config, config_dir, current_profile, home_config_dir, list_profiles,
+        load_profile, profile_path, resolve_bare_profile, save_current_profile, settings_path,
         validate_profile_name, write_default_template, LoadedProfile, RawVision, DEFAULT_PROFILE,
         SETTINGS_FILE,
     };
@@ -774,12 +786,49 @@ X-V = "1"
     #[test]
     fn config_dir_resolves_home_or_errors() {
         assert_eq!(
-            config_dir(Some("/Users/x")).unwrap(),
+            config_dir(Some(Path::new("/Users/x"))).unwrap(),
             Path::new("/Users/x").join(super::CONFIG_DIR_NAME)
         );
+        // A non-blank home is used verbatim, whitespace included.
+        assert_eq!(
+            config_dir(Some(Path::new("/Users/x "))).unwrap(),
+            Path::new("/Users/x ").join(super::CONFIG_DIR_NAME)
+        );
         assert!(config_dir(None).is_err());
-        assert!(config_dir(Some("")).is_err());
-        assert!(config_dir(Some("   ")).is_err());
+        assert!(config_dir(Some(Path::new(""))).is_err());
+        assert!(config_dir(Some(Path::new("   "))).is_err());
+    }
+
+    /// A non-UTF-8 home is a path, not an error: only a *blank* home counts as
+    /// absent, so the lookup no longer narrows the platform's path to UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn config_dir_keeps_a_non_utf8_home() {
+        use std::os::unix::ffi::OsStrExt;
+        let home = Path::new(std::ffi::OsStr::from_bytes(b"/home/\xff"));
+        assert_eq!(
+            config_dir(Some(home)).unwrap(),
+            home.join(super::CONFIG_DIR_NAME)
+        );
+    }
+
+    #[test]
+    fn no_home_error_points_at_the_config_dir() {
+        let msg = config_dir(None).err().unwrap().to_string();
+        assert!(msg.contains("home directory"), "msg: {msg}");
+        assert!(msg.contains("~/.ai-bridge"), "msg: {msg}");
+    }
+
+    /// The wiring the Windows startup fix is about: the config directory is the
+    /// platform home joined with `.ai-bridge`, on every platform. The Windows
+    /// leg of the CI `test` job is what exercises the lookup there.
+    #[test]
+    fn home_config_dir_joins_the_platform_home() {
+        let home = std::env::home_dir().expect("a test runner must have a home directory");
+        assert_eq!(
+            home_config_dir().unwrap(),
+            home.join(super::CONFIG_DIR_NAME)
+        );
     }
 
     #[test]

@@ -107,7 +107,8 @@ fn main() {
 #[tokio::main]
 async fn run(cli: Cli) -> Result<(), Error> {
     // Init tracing before loading config so parse-time warnings render.
-    // Only RUST_LOG is read from the environment (tracing convention).
+    // `RUST_LOG` is the only environment variable that feeds a setting; the
+    // config directory is located by the platform, not read here (ADR-0005).
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -371,10 +372,24 @@ mod tests {
         assert!(cli(&["a", "b"]).is_err());
     }
 
+    /// An `OsString` that is not valid Unicode: a lone surrogate on Windows, an
+    /// invalid byte sequence elsewhere.
+    #[cfg(unix)]
+    fn non_unicode_arg() -> OsString {
+        use std::os::unix::ffi::OsStrExt;
+        OsString::from(std::ffi::OsStr::from_bytes(b"\xff\xfe"))
+    }
+
+    #[cfg(windows)]
+    fn non_unicode_arg() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        // A lone surrogate is not valid text, so `to_str` rejects it.
+        OsString::from_wide(&[0xD800])
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn non_utf8_argument_is_rejected() {
-        use std::os::unix::ffi::OsStrExt;
-        let bad = OsString::from(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
-        assert!(parse_cli(&[OsString::from("ai-bridge"), bad]).is_err());
+        assert!(parse_cli(&[OsString::from("ai-bridge"), non_unicode_arg()]).is_err());
     }
 }

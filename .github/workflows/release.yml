@@ -14,8 +14,14 @@ permissions:
 
 jobs:
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows 的家目录解析（USERPROFILE，忽略 HOME）只在 windows 上生效，
+        # 之前 test 只跑 ubuntu，这条路径从未被执行过
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

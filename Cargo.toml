@@ -2,6 +2,10 @@
 name = "ai-bridge"
 version = "0.1.0"
 edition = "2021"
+# `std::env::home_dir` resolves the home directory correctly from 1.85 and is
+# no longer deprecated from 1.87; an older toolchain would silently bring back
+# the Windows `HOME` bug this pins against.
+rust-version = "1.87"
 
 [dependencies]
 axum = "0.7"

@@ -74,7 +74,7 @@ Each invariant states what must hold, how it gets broken, and what currently gua
 | | Invariant | How it breaks | Guard |
 |---|---|---|---|
 | INV-1 | Wire formats are declared, never inferred (main upstream and `[vision]`) | adding a URL heuristic "just for this one case" | required `upstream_type`, no URL branch (ADR-0002, ADR-0004) |
-| INV-2 | Configuration is TOML profiles; the only env var read is `RUST_LOG` | moving a setting back into the environment, where nothing validates it | `deny_unknown_fields`; env reads are greppable (ADR-0005) |
+| INV-2 | Configuration is TOML profiles; no configuration *value* is read from the environment — `RUST_LOG` is the tracing filter, and the config directory is located by the platform | moving a setting back into the environment, where nothing validates it | `deny_unknown_fields`; `src/` has no `env::var` outside tests — `std::env` is reached only for `home_dir` and `args_os`, and `RUST_LOG` arrives via `EnvFilter::try_from_default_env` (ADR-0005) |
 | INV-3 | Outbound effort comes only from `[reasoning] effort`; no per-model logic | mapping effort from the model name | single stamping point, `apply_reasoning_policy` (ADR-0011) |
 | INV-4 | The client's `model` is always overridden | honouring the client's model for "compatibility" | override in every entry (ADR-0013) |
 | INV-5 | The error envelope follows the local entry, from one shaping function | adding a second envelope site | `into_entry_response`, per-entry tests (ADR-0010) |
@@ -98,7 +98,6 @@ Deviations of the code from the requirements above, and questions still open. ID
 | DEV-3 | `[vision]` has no `upstream_type` key and its format is guessed from the URL | FR-5, FR-15 | ADR-0002 and ADR-0004 require an explicit key instead |
 | DEV-4 | The outbound token-cap field name is chosen by a model-name list (`is_openai_o_series`) | FR-7 | replace with `[chat] max_tokens_field` |
 | DEV-5 | `forward_to_zen` / `forward_to_zen_streaming` name the upstream "zen" | vocabulary | the glossary's term is *Upstream* |
-| DEV-6 | `HOME` is read for path expansion but is not registered as an exception | FR-6 | either register it in the docs or stop reading it |
 | DEV-7 | The SSE field/block parsing helpers exist twice, near-verbatim | — | two copies drift independently |
 | DEV-8 | The three conversion handlers repeat the same preamble | — | routing plumbing is duplicated per entry |
 | DEV-9 | Several conversion functions are very long | — | the SSE translator is the largest |

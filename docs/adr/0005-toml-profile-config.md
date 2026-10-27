@@ -2,7 +2,9 @@
 
 All upstream configuration lives in `~/.ai-bridge/<name>.toml` — one file per upstream configuration ("profile"). The binary selects a profile by CLI argument (`ai-bridge deepseek` → `deepseek.toml`), defaulting to `default.toml`; `ai-bridge --list` shows what is available. Required keys are `upstream_type` / `url` / `api_key`, with optional `[headers]`, `[reasoning]`, and `[vision]` tables. Unknown keys fail startup, so a typo cannot silently disable a setting.
 
-Only `RUST_LOG` is read, because it is the `tracing` convention.
+No configuration *value* is read from the environment. `RUST_LOG` is the one exception, because it is the `tracing` convention.
+
+The profile *directory* has to be located before any profile can be read, so that one lookup is delegated to the platform rather than to a configuration surface: `std::env::home_dir` — `HOME`, falling back to the passwd entry, on POSIX; `USERPROFILE`, falling back to `GetUserProfileDirectory`, on Windows. Windows deliberately never consults `HOME`, because Git Bash / MSYS2 / Cygwin export POSIX paths (`/c/Users/you`, `/home/you`) that a native binary resolves against the current drive, silently creating the config directory in the wrong place.
 
 Rationale:
 

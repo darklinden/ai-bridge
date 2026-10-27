@@ -16,7 +16,7 @@ This file describes the program as it ships today. Where it disagrees with [`doc
 
 ## Requirements
 
-- Rust (stable toolchain, edition 2021). Install with [rustup](https://rustup.rs/).
+- Rust 1.87 or newer (stable toolchain, edition 2021; the floor is `rust-version` in `Cargo.toml`). Install with [rustup](https://rustup.rs/).
 
 ## Build & run
 
@@ -106,7 +106,7 @@ Key semantics:
 - `model` — every request body has its `model` replaced by this value; a client-supplied model never reaches the upstream.
 - `[reasoning] effort` — the single source of truth for the outgoing effort value; only stamped when the client actually asked for reasoning. No per-model mapping exists.
 - `[vision]` — enabled only when `url`, `api_key`, and `model` are all present and non-blank; otherwise vision logs which keys are missing and disables itself. The endpoint's format is inferred from its path today; making it an explicit declaration is a pending change (see the deviations list linked above).
-- Configuration comes only from the profile file. The only variables read are `RUST_LOG` (a `tracing` filter, default `info`) and `HOME` (to locate `~/.ai-bridge`).
+- Configuration comes only from the profile file, and no configuration *value* is read from the environment; `RUST_LOG` (a `tracing` filter, default `info`) is the one exception. The directory holding `~/.ai-bridge` is not configuration either: it is the platform home directory — `HOME` on POSIX, `USERPROFILE` on Windows, where `HOME` is deliberately ignored (ADR-0005).
 
 Configuration decisions and their rationale are recorded in [`docs/adr/`](docs/adr/).
 
