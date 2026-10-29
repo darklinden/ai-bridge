@@ -66,6 +66,12 @@ pub(crate) struct Config {
     pub(crate) auth_key: Option<String>,
     /// Headers from the `[headers]` table overridden on every upstream request.
     pub(crate) override_headers: HeaderMap,
+    /// Fields from the `[extra_body]` table merged into every outgoing request
+    /// body for the main upstream (never the vision endpoint). Applied at the
+    /// single outbound seam, [`build_upstream_request`], after the reasoning
+    /// policy and with the configured value winning on conflicts; keys the
+    /// proxy owns are rejected at config time by `config::validate_extra_body`.
+    pub(crate) extra_body: Option<Value>,
     /// Optional separately configured vision model for image description.
     pub(crate) vision: Option<VisionConfig>,
     /// Whether the third-party vision supplement is enabled (the
@@ -189,9 +195,7 @@ impl UpstreamReasoningPolicy {
         let effort = match effort.map(str::trim).filter(|v| !v.is_empty()) {
             None => ReasoningEffortOverride::Set("max".into()),
             Some(raw) => match raw.to_ascii_lowercase().as_str() {
-                "off" | "drop" | "none" | "disable" | "disabled" => {
-                    ReasoningEffortOverride::Drop
-                }
+                "off" | "drop" | "none" | "disable" | "disabled" => ReasoningEffortOverride::Drop,
                 _ => ReasoningEffortOverride::Set(raw.to_ascii_lowercase()),
             },
         };
@@ -257,7 +261,11 @@ pub(crate) fn apply_reasoning_policy(
                 let ReasoningEffortOverride::Set(value) = &policy.effort else {
                     return;
                 };
-                if body.get("reasoning").map(|r| !r.is_object()).unwrap_or(true) {
+                if body
+                    .get("reasoning")
+                    .map(|r| !r.is_object())
+                    .unwrap_or(true)
+                {
                     body["reasoning"] = json!({});
                 }
                 body["reasoning"]["effort"] = json!(value);
@@ -271,6 +279,39 @@ pub(crate) fn apply_reasoning_policy(
 fn remove_json_key(body: &mut Value, key: &str) -> bool {
     body.as_object_mut()
         .is_some_and(|obj| obj.remove(key).is_some())
+}
+
+/// Merge the profile's `[extra_body]` fields into a request body about to be
+/// forwarded, with the configured value winning every conflict.
+///
+/// Objects merge key by key (recursively, so a nested vendor object the client
+/// or a conversion already produced is completed rather than replaced); any
+/// other value — scalar, array, or a type mismatch — replaces the existing one
+/// wholesale. New keys are appended after the existing ones in a fixed key
+/// order, so the same profile always serialises the same way.
+///
+/// Keys the proxy owns (`model`, `stream`, the conversation container, the
+/// reasoning fields, `stream_options.include_usage`) are rejected at startup
+/// by `config::validate_extra_body`, so nothing here needs to special-case
+/// them.
+pub(crate) fn apply_extra_body(body: &mut Value, extra: &Value) {
+    merge_json(body, extra);
+}
+
+fn merge_json(target: &mut Value, extra: &Value) {
+    match (target, extra) {
+        (Value::Object(target_map), Value::Object(extra_map)) => {
+            for (key, value) in extra_map {
+                match target_map.get_mut(key) {
+                    Some(existing) => merge_json(existing, value),
+                    None => {
+                        target_map.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target, extra) => *target = extra.clone(),
+    }
 }
 
 /// Shared application state holding configuration and an HTTP client with connection pooling.
@@ -302,6 +343,8 @@ pub(crate) struct UpstreamTarget {
     pub(crate) api_key: String,
     pub(crate) upstream_type: UpstreamType,
     pub(crate) override_headers: HeaderMap,
+    /// `[extra_body]` fields for this target; `None` for the vision endpoint.
+    pub(crate) extra_body: Option<Value>,
 }
 
 impl From<&Config> for UpstreamTarget {
@@ -311,6 +354,7 @@ impl From<&Config> for UpstreamTarget {
             api_key: c.api_key.clone(),
             upstream_type: c.upstream_type,
             override_headers: c.override_headers.clone(),
+            extra_body: c.extra_body.clone(),
         }
     }
 }
@@ -322,12 +366,21 @@ impl From<&VisionConfig> for UpstreamTarget {
             api_key: v.api_key.clone(),
             upstream_type: v.upstream_type,
             override_headers: v.override_headers.clone(),
+            // `[extra_body]` belongs to the main upstream only: a vision call is
+            // a generated describe request, and vendor fields could break it.
+            extra_body: None,
         }
     }
 }
 
 /// Build a POST request to an upstream with the default auth/content-type
 /// headers plus any override headers (overrides win).
+///
+/// The profile's `[extra_body]` fields are merged into `request_body` here —
+/// the one place every outbound request passes through, so every entry ×
+/// upstream combination (pass-through included) inherits them. The merge
+/// happens after conversion and after the reasoning policy, and the configured
+/// value wins (reserved keys are rejected at config time).
 ///
 /// Anthropic Messages upstreams authenticate with `x-api-key` +
 /// `anthropic-version`; OpenAI-style upstreams use `Authorization: Bearer`.
@@ -338,7 +391,7 @@ impl From<&VisionConfig> for UpstreamTarget {
 fn build_upstream_request(
     client: &reqwest::Client,
     target: &UpstreamTarget,
-    request_body: &Value,
+    mut request_body: Value,
 ) -> Result<reqwest::RequestBuilder, Error> {
     let mut headers = HeaderMap::new();
     match target.upstream_type {
@@ -348,10 +401,7 @@ fn build_upstream_request(
                 HeaderValue::from_str(&target.api_key)
                     .map_err(|e| Error::Config(format!("Invalid API key header: {e}")))?,
             );
-            headers.insert(
-                "anthropic-version",
-                HeaderValue::from_static("2023-06-01"),
-            );
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         }
         UpstreamType::OaiChat | UpstreamType::OaiResponses => {
             headers.insert(
@@ -369,7 +419,11 @@ fn build_upstream_request(
         headers.insert(name.clone(), value.clone());
     }
 
-    let body_bytes = serde_json::to_vec(request_body)
+    if let Some(extra) = &target.extra_body {
+        apply_extra_body(&mut request_body, extra);
+    }
+
+    let body_bytes = serde_json::to_vec(&request_body)
         .map_err(|e| Error::Config(format!("Failed to serialize request body: {e}")))?;
 
     Ok(client
@@ -422,15 +476,17 @@ async fn read_upstream_error(resp: reqwest::Response) -> (Value, String) {
 /// Check an upstream response status: 2xx passes through untouched for the
 /// caller to parse/stream; otherwise the body is consumed and relayed as
 /// [`Error::Upstream`] with the real status code and an extracted reason.
-async fn ensure_upstream_success(
-    response: reqwest::Response,
-) -> Result<reqwest::Response, Error> {
+async fn ensure_upstream_success(response: reqwest::Response) -> Result<reqwest::Response, Error> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
     let (body, reason) = read_upstream_error(response).await;
-    Err(Error::Upstream { status, reason, body })
+    Err(Error::Upstream {
+        status,
+        reason,
+        body,
+    })
 }
 
 /// Forward a non-streaming request to the upstream API.
@@ -439,7 +495,7 @@ pub(crate) async fn forward_to_zen(
     client: &reqwest::Client,
     target: &UpstreamTarget,
 ) -> Result<Value, Error> {
-    let response = build_upstream_request(client, target, &request_body)?
+    let response = build_upstream_request(client, target, request_body)?
         .send()
         .await
         .map_err(|e| Error::Forward(format!("Request failed: {e}")))?;
@@ -474,7 +530,7 @@ pub(crate) async fn forward_to_zen_streaming(
     client: &reqwest::Client,
     target: &UpstreamTarget,
 ) -> Result<reqwest::Response, Error> {
-    let response = build_upstream_request(client, target, &request_body)?
+    let response = build_upstream_request(client, target, request_body)?
         .send()
         .await
         .map_err(|e| Error::Forward(format!("Request failed: {e}")))?;
@@ -488,7 +544,7 @@ pub(crate) async fn forward_to_responses(
     client: &reqwest::Client,
     target: &UpstreamTarget,
 ) -> Result<Value, Error> {
-    let response = build_upstream_request(client, target, &request_body)?
+    let response = build_upstream_request(client, target, request_body)?
         .send()
         .await
         .map_err(|e| Error::Forward(format!("Request failed: {e}")))?;
@@ -523,7 +579,7 @@ pub(crate) async fn forward_to_responses_streaming(
     client: &reqwest::Client,
     target: &UpstreamTarget,
 ) -> Result<reqwest::Response, Error> {
-    let response = build_upstream_request(client, target, &request_body)?
+    let response = build_upstream_request(client, target, request_body)?
         .send()
         .await
         .map_err(|e| Error::Forward(format!("Request failed: {e}")))?;
@@ -537,7 +593,7 @@ mod tests {
         apply_reasoning_policy, header_overrides_from_pairs, parse_bool, parse_error_payload,
         ReasoningEffortOverride, UpstreamReasoningPolicy, UpstreamType,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn parse_bool_maps_truthy_values() {
@@ -622,17 +678,32 @@ mod tests {
 
         // Explicit value wins over whatever the client sent.
         let mut body = json!({"reasoning_effort": "high"});
-        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(None, Some("xhigh")), true);
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::OaiChat,
+            &policy(None, Some("xhigh")),
+            true,
+        );
         assert_eq!(body["reasoning_effort"], "xhigh");
 
         // Drop removes an existing field…
         let mut body = json!({"reasoning_effort": "high"});
-        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(None, Some("off")), true);
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::OaiChat,
+            &policy(None, Some("off")),
+            true,
+        );
         assert!(body.get("reasoning_effort").is_none());
 
         // …and master-off removes it even with a Set configured.
         let mut body = json!({"reasoning_effort": "high"});
-        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(Some("0"), None), true);
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::OaiChat,
+            &policy(Some("0"), None),
+            true,
+        );
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -647,7 +718,12 @@ mod tests {
 
         // Master off wins over everything: even a requesting client gets stripped.
         let mut body = json!({"reasoning_effort": "high"});
-        apply_reasoning_policy(&mut body, UpstreamType::OaiChat, &policy(Some("0"), None), true);
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::OaiChat,
+            &policy(Some("0"), None),
+            true,
+        );
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -655,24 +731,44 @@ mod tests {
     fn apply_policy_responses_preserves_other_reasoning_keys() {
         // Set: effort stamped inside the existing object; summary preserved.
         let mut body = json!({"reasoning": {"effort": "high", "summary": "auto"}});
-        apply_reasoning_policy(&mut body, UpstreamType::OaiResponses, &policy(None, Some("low")), true);
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::OaiResponses,
+            &policy(None, Some("low")),
+            true,
+        );
         assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["reasoning"]["summary"], "auto");
 
         // Set: missing reasoning object is created.
         let mut body = json!({});
-        apply_reasoning_policy(&mut body, UpstreamType::OaiResponses, &policy(None, None), true);
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::OaiResponses,
+            &policy(None, None),
+            true,
+        );
         assert_eq!(body["reasoning"]["effort"], "max");
 
         // Drop: effort removed, sibling keys survive.
         let mut body = json!({"reasoning": {"effort": "high", "summary": "auto"}});
-        apply_reasoning_policy(&mut body, UpstreamType::OaiResponses, &policy(None, Some("off")), true);
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::OaiResponses,
+            &policy(None, Some("off")),
+            true,
+        );
         assert!(body["reasoning"].get("effort").is_none());
         assert_eq!(body["reasoning"]["summary"], "auto");
 
         // Drop: empty reasoning object is pruned altogether.
         let mut body = json!({"reasoning": {"effort": "high"}});
-        apply_reasoning_policy(&mut body, UpstreamType::OaiResponses, &policy(None, Some("off")), true);
+        apply_reasoning_policy(
+            &mut body,
+            UpstreamType::OaiResponses,
+            &policy(None, Some("off")),
+            true,
+        );
         assert!(body.get("reasoning").is_none());
     }
 
@@ -759,9 +855,7 @@ mod tests {
     fn overrides(entries: &[(&str, &str)]) -> http::HeaderMap {
         header_overrides_from_pairs(
             "[headers]",
-            entries
-                .iter()
-                .map(|(n, v)| (n.to_string(), v.to_string())),
+            entries.iter().map(|(n, v)| (n.to_string(), v.to_string())),
         )
     }
 
@@ -856,5 +950,222 @@ mod tests {
         let long = "x".repeat(2000);
         let (_, reason) = parse_error_payload(&long);
         assert_eq!(reason.chars().count(), 500);
+    }
+
+    // -----------------------------------------------------------------------
+    // [extra_body] merging
+    // -----------------------------------------------------------------------
+
+    fn merged(base: Value, extra: Value) -> Value {
+        let mut body = base;
+        super::apply_extra_body(&mut body, &extra);
+        body
+    }
+
+    #[test]
+    fn extra_body_adds_new_keys_and_overrides_wholesale_values() {
+        // Scalars and arrays are replaced, not merged element by element.
+        let body = merged(
+            json!({"model": "m", "messages": [], "stop": ["a"], "temperature": 0.2}),
+            json!({
+                "providerOptions": {"gateway": {"only": ["deepseek"]}},
+                "stop": ["b", "c"],
+                "temperature": 0.0
+            }),
+        );
+        assert_eq!(
+            body["providerOptions"]["gateway"]["only"],
+            json!(["deepseek"])
+        );
+        assert_eq!(body["stop"], json!(["b", "c"]));
+        assert_eq!(body["temperature"], 0.0);
+        // Untouched proxy fields survive.
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["messages"], json!([]));
+    }
+
+    #[test]
+    fn extra_body_deep_merges_objects_with_config_winning() {
+        let body = merged(
+            json!({
+                "providerOptions": {
+                    "gateway": {"only": ["a"], "order": ["x"]},
+                    "client": "keep"
+                }
+            }),
+            json!({
+                "providerOptions": {
+                    "gateway": {"only": ["deepseek"], "has": ["vision"]}
+                }
+            }),
+        );
+        // Conflicting leaf: config wins.
+        assert_eq!(
+            body["providerOptions"]["gateway"]["only"],
+            json!(["deepseek"])
+        );
+        // Sibling leaves and objects the config did not mention survive.
+        assert_eq!(body["providerOptions"]["gateway"]["order"], json!(["x"]));
+        assert_eq!(body["providerOptions"]["gateway"]["has"], json!(["vision"]));
+        assert_eq!(body["providerOptions"]["client"], "keep");
+    }
+
+    #[test]
+    fn extra_body_replaces_on_type_mismatch() {
+        // Object vs array is not a merge — config wins as a whole.
+        let body = merged(
+            json!({"providerOptions": {"a": 1}}),
+            json!({"providerOptions": ["x"]}),
+        );
+        assert_eq!(body["providerOptions"], json!(["x"]));
+
+        let body = merged(
+            json!({"providerOptions": ["x"]}),
+            json!({"providerOptions": {"a": 1}}),
+        );
+        assert_eq!(body["providerOptions"], json!({"a": 1}));
+    }
+
+    #[test]
+    fn extra_body_empty_object_is_a_noop() {
+        let body = merged(json!({"model": "m", "messages": []}), json!({}));
+        assert_eq!(body, json!({"model": "m", "messages": []}));
+    }
+
+    /// Merge order only: existing keys keep their position and a new key is
+    /// appended after them (`serde_json` preserve_order). The profile's own key
+    /// order (TOML table iteration) is fixed too — `config` covers that end.
+    #[test]
+    fn extra_body_appends_new_keys_after_existing_ones() {
+        let body = merged(
+            json!({"model": "m", "messages": []}),
+            json!({"zeta": 1, "alpha": 2}),
+        );
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"model":"m","messages":[],"zeta":1,"alpha":2}"#
+        );
+    }
+
+    /// `[extra_body]` belongs to the main upstream; vision calls are generated
+    /// describe requests and must not inherit vendor fields.
+    #[test]
+    fn vision_target_carries_no_extra_body() {
+        let vision = super::VisionConfig {
+            url: "https://v.example/v1/chat/completions".into(),
+            api_key: "k".into(),
+            model: "vl".into(),
+            upstream_type: UpstreamType::OaiChat,
+            override_headers: http::HeaderMap::new(),
+            prompt_mode: "auto".into(),
+            custom_prompt: None,
+            max_tokens: None,
+        };
+        let target = super::UpstreamTarget::from(&vision);
+        assert!(target.extra_body.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // The outbound seam: build_upstream_request actually applies the merge
+    // -----------------------------------------------------------------------
+
+    fn main_target(
+        upstream_type: UpstreamType,
+        extra_body: Option<Value>,
+    ) -> super::UpstreamTarget {
+        super::UpstreamTarget {
+            url: "https://up.example/v1/chat/completions".into(),
+            api_key: "k".into(),
+            upstream_type,
+            override_headers: http::HeaderMap::new(),
+            extra_body,
+        }
+    }
+
+    fn main_config(extra_body: Option<Value>) -> super::Config {
+        super::Config {
+            upstream_type: UpstreamType::OaiChat,
+            url: "https://up.example/v1/chat/completions".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            listen_addr: "127.0.0.1".into(),
+            listen_port: 18650,
+            auth_key: None,
+            override_headers: http::HeaderMap::new(),
+            extra_body,
+            vision: None,
+            vision_supplement_enabled: false,
+            reasoning_policy: UpstreamReasoningPolicy::parse(None, None),
+        }
+    }
+
+    /// Read back the in-memory request body as JSON (every request this proxy
+    /// builds is a full `Vec<u8>` body).
+    fn sent_body(request: reqwest::Request) -> Value {
+        let bytes = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .expect("in-memory request body");
+        serde_json::from_slice(bytes).expect("request body is JSON")
+    }
+
+    #[test]
+    fn build_upstream_request_merges_extra_body_into_the_sent_body() {
+        let client = reqwest::Client::new();
+        let target = main_target(
+            UpstreamType::OaiChat,
+            Some(json!({
+                "providerOptions": {"gateway": {"only": ["deepseek"]}},
+                "temperature": 0.0
+            })),
+        );
+        let request = super::build_upstream_request(
+            &client,
+            &target,
+            json!({"model": "m", "messages": [], "temperature": 0.7}),
+        )
+        .expect("builder")
+        .build()
+        .expect("complete request");
+
+        assert_eq!(request.method().as_str(), "POST");
+        assert_eq!(
+            request.url().as_str(),
+            "https://up.example/v1/chat/completions"
+        );
+
+        // The bytes that would go on the wire carry the merged fields: config
+        // wins on the conflict, untouched keys survive.
+        let body = sent_body(request);
+        assert_eq!(
+            body["providerOptions"]["gateway"]["only"],
+            json!(["deepseek"])
+        );
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["messages"], json!([]));
+    }
+
+    #[test]
+    fn build_upstream_request_without_extra_body_sends_the_body_unchanged() {
+        let client = reqwest::Client::new();
+        let target = main_target(UpstreamType::OaiChat, None);
+        let request =
+            super::build_upstream_request(&client, &target, json!({"model": "m", "messages": []}))
+                .expect("builder")
+                .build()
+                .expect("complete request");
+
+        assert_eq!(sent_body(request), json!({"model": "m", "messages": []}));
+    }
+
+    #[test]
+    fn main_target_carries_the_configured_extra_body() {
+        let extra = json!({"providerOptions": {"gateway": {"only": ["deepseek"]}}});
+        let target = super::UpstreamTarget::from(&main_config(Some(extra.clone())));
+        assert_eq!(target.extra_body, Some(extra));
+        assert!(super::UpstreamTarget::from(&main_config(None))
+            .extra_body
+            .is_none());
     }
 }

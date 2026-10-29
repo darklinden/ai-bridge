@@ -143,19 +143,14 @@ pub fn chat_to_anthropic_request(body: &Value) -> Result<Value, Error> {
 
     // tool_choice: OpenAI string/object → Anthropic {type} form.
     // Also fold `parallel_tool_calls=false` into disable_parallel_tool_use.
-    let disable_parallel = body
-        .get("parallel_tool_calls")
-        .and_then(Value::as_bool)
-        == Some(false);
+    let disable_parallel = body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false);
     if let Some(tc) = body.get("tool_choice") {
         if let Some(mapped) = map_chat_tool_choice(tc) {
             result["tool_choice"] = mapped;
         }
     }
     if disable_parallel {
-        let tc = result
-            .get_mut("tool_choice")
-            .and_then(Value::as_object_mut);
+        let tc = result.get_mut("tool_choice").and_then(Value::as_object_mut);
         if let Some(tc) = tc {
             tc.insert("disable_parallel_tool_use".to_string(), json!(true));
         } else {
@@ -287,9 +282,7 @@ fn chat_message_to_anthropic(msg: &Value) -> Result<Value, Error> {
                                     .and_then(Value::as_str)
                                     .unwrap_or("");
                                 if url.starts_with("data:") {
-                                    if let Some((media_type, data)) =
-                                        parse_data_url(url)
-                                    {
+                                    if let Some((media_type, data)) = parse_data_url(url) {
                                         blocks.push(json!({
                                             "type": "image",
                                             "source": {
@@ -444,7 +437,11 @@ pub(crate) fn parse_data_url_pub(url: &str) -> Option<(String, String)> {
 /// response. `model` is echoed back as `choices[0].message` metadata.
 pub fn anthropic_to_chat_response(body: &Value, model: &str) -> Result<Value, Error> {
     let mut result = json!({});
-    if let Some(m) = body.get("model").and_then(Value::as_str).map(str::to_string) {
+    if let Some(m) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
         result["model"] = json!(m);
     } else {
         result["model"] = json!(model);
@@ -465,7 +462,9 @@ pub fn anthropic_to_chat_response(body: &Value, model: &str) -> Result<Value, Er
                 }
                 "thinking" => {
                     if let Some(t) = block.get("thinking").and_then(Value::as_str) {
-                        reasoning_content.get_or_insert_with(String::new).push_str(t);
+                        reasoning_content
+                            .get_or_insert_with(String::new)
+                            .push_str(t);
                     }
                 }
                 "tool_use" => {
@@ -521,8 +520,14 @@ pub fn anthropic_to_chat_response(body: &Value, model: &str) -> Result<Value, Er
             out_usage["completion_tokens"] = v.clone();
         }
         let sum = |a: u64, b: u64| a + b;
-        let prompt = out_usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let completion = out_usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let prompt = out_usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let completion = out_usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         out_usage["total_tokens"] = json!(sum(prompt, completion));
         result["usage"] = out_usage;
     }
@@ -829,8 +834,11 @@ mod tests {
     /// Drive `anthropic_to_chat_sse` with canned Anthropic SSE frames and
     /// collect the emitted `data:` JSON values (the `[DONE]` sentinel is dropped).
     async fn run_chat_sse(frames: Vec<String>, log_resp: bool) -> Vec<Value> {
-        let upstream =
-            futures::stream::iter(frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))));
+        let upstream = futures::stream::iter(
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
         let out = anthropic_to_chat_sse(upstream, "gpt-5".to_string(), ReqLog::new(), log_resp);
         let chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
         let mut text = String::new();
@@ -847,8 +855,11 @@ mod tests {
 
     /// Same drive as `run_chat_sse`, but returns the assembled `[RESP]` log line.
     async fn run_chat_sse_logged(frames: Vec<String>, log_resp: bool) -> String {
-        let upstream =
-            futures::stream::iter(frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))));
+        let upstream = futures::stream::iter(
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
         let (reqlog, captured) = ReqLog::captured();
         let out = anthropic_to_chat_sse(upstream, "gpt-5".to_string(), reqlog, log_resp);
         let _chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
@@ -933,11 +944,21 @@ mod tests {
         });
         let result = chat_to_anthropic_request(&body).unwrap();
         // assistant message → tool_use block
-        let assistant = result["messages"].as_array().unwrap().iter().find(|m| m["role"] == "assistant").unwrap();
+        let assistant = result["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
         assert_eq!(assistant["content"][0]["type"], "tool_use");
         assert_eq!(assistant["content"][0]["input"]["city"], "SF");
         // tool message → user with tool_result
-        let tool_msg = result["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user").unwrap();
+        let tool_msg = result["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user")
+            .unwrap();
         assert_eq!(tool_msg["content"][0]["type"], "tool_result");
         assert_eq!(tool_msg["content"][0]["tool_use_id"], "call_1");
     }
@@ -956,7 +977,10 @@ mod tests {
 
         let result = anthropic_to_chat_response(&body, "gpt-5").unwrap();
         assert_eq!(result["object"], "chat.completion");
-        assert_eq!(result["choices"][0]["message"]["content"][0]["text"], "hello");
+        assert_eq!(
+            result["choices"][0]["message"]["content"][0]["text"],
+            "hello"
+        );
         assert_eq!(result["choices"][0]["finish_reason"], "stop");
         assert_eq!(result["usage"]["prompt_tokens"], 5);
         assert_eq!(result["usage"]["completion_tokens"], 3);
@@ -979,8 +1003,14 @@ mod tests {
             "stop_reason": "tool_use"
         });
         let result = anthropic_to_chat_response(&body, "gpt-5").unwrap();
-        assert_eq!(result["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_weather");
-        assert_eq!(result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"SF\"}");
+        assert_eq!(
+            result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"SF\"}"
+        );
         assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
     }
 
@@ -998,8 +1028,14 @@ mod tests {
             "stop_reason": "end_turn"
         });
         let result = anthropic_to_chat_response(&body, "gpt-5").unwrap();
-        assert_eq!(result["choices"][0]["message"]["reasoning_content"], "let me think");
-        assert_eq!(result["choices"][0]["message"]["content"][0]["text"], "answer");
+        assert_eq!(
+            result["choices"][0]["message"]["reasoning_content"],
+            "let me think"
+        );
+        assert_eq!(
+            result["choices"][0]["message"]["content"][0]["text"],
+            "answer"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1024,13 +1060,19 @@ mod tests {
 
         let contents: Vec<&str> = with_log
             .iter()
-            .filter_map(|v| v.pointer("/choices/0/delta/content").and_then(Value::as_str))
+            .filter_map(|v| {
+                v.pointer("/choices/0/delta/content")
+                    .and_then(Value::as_str)
+            })
             .collect();
         assert_eq!(contents, vec!["Mock ", "anthropic"]);
 
         let finishes: Vec<&str> = with_log
             .iter()
-            .filter_map(|v| v.pointer("/choices/0/finish_reason").and_then(Value::as_str))
+            .filter_map(|v| {
+                v.pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+            })
             .collect();
         assert_eq!(finishes, vec!["stop"]);
     }
@@ -1047,7 +1089,10 @@ mod tests {
         // only the thinking_delta should carry the real text.
         let reasoning: Vec<&str> = out
             .iter()
-            .filter_map(|v| v.pointer("/choices/0/delta/reasoning_content").and_then(Value::as_str))
+            .filter_map(|v| {
+                v.pointer("/choices/0/delta/reasoning_content")
+                    .and_then(Value::as_str)
+            })
             .filter(|s| !s.is_empty())
             .collect();
         assert_eq!(reasoning, vec!["reasoning here"]);
@@ -1065,7 +1110,10 @@ mod tests {
 
         let names: Vec<&str> = out
             .iter()
-            .filter_map(|v| v.pointer("/choices/0/delta/tool_calls/0/function/name").and_then(Value::as_str))
+            .filter_map(|v| {
+                v.pointer("/choices/0/delta/tool_calls/0/function/name")
+                    .and_then(Value::as_str)
+            })
             .collect();
         assert_eq!(names, vec!["get_weather"]);
 
@@ -1081,7 +1129,10 @@ mod tests {
 
         let finishes: Vec<&str> = out
             .iter()
-            .filter_map(|v| v.pointer("/choices/0/finish_reason").and_then(Value::as_str))
+            .filter_map(|v| {
+                v.pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+            })
             .collect();
         assert_eq!(finishes, vec!["tool_calls"]);
     }
@@ -1255,6 +1306,9 @@ mod tests {
         let error = logged.find("[ERR-RESP");
         assert!(marker.is_some(), "log was: {logged}");
         assert!(error.is_some(), "log was: {logged}");
-        assert!(marker < error, "marker must precede the error line: {logged}");
+        assert!(
+            marker < error,
+            "marker must precede the error line: {logged}"
+        );
     }
 }

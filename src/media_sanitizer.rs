@@ -179,7 +179,9 @@ mod tests {
     fn registry_normalizes_namespaces_and_context_markers() {
         assert!(is_confirmed_text_only_model("deepseek/deepseek-v4-pro"));
         assert!(is_confirmed_text_only_model("GLM-5.2[1M]"));
-        assert!(is_confirmed_text_only_model("Qwen/Qwen3-Coder-480B-A35B-Instruct"));
+        assert!(is_confirmed_text_only_model(
+            "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+        ));
         assert!(is_confirmed_text_only_model("MiniMax-M2.7-Highspeed"));
         assert!(is_confirmed_text_only_model("LongCat-2.0"));
         assert!(!is_confirmed_text_only_model("glm-5.2v"));
@@ -362,8 +364,8 @@ mod tests {
         let mut sanitized = read_image_body.clone();
         let replaced = replace_images_for_text_only_model(&mut sanitized, "deepseek-v4-flash");
         assert_eq!(replaced, 1);
-        let chat = crate::convert::anthropic_to_openai_with_reasoning_content(sanitized, true)
-            .unwrap();
+        let chat =
+            crate::convert::anthropic_to_openai_with_reasoning_content(sanitized, true).unwrap();
         let serialized = chat.to_string();
         assert!(
             !serialized.contains("image_url"),
@@ -372,8 +374,8 @@ mod tests {
 
         // Vision-capable upstream: images must be preserved end to end.
         let unsanitized = read_image_body.clone();
-        let chat = crate::convert::anthropic_to_openai_with_reasoning_content(unsanitized, true)
-            .unwrap();
+        let chat =
+            crate::convert::anthropic_to_openai_with_reasoning_content(unsanitized, true).unwrap();
         assert!(
             chat.to_string().contains("image_url"),
             "vision-capable upstream should still receive image_url"

@@ -662,8 +662,14 @@ mod tests {
             }
         });
 
-        assert!(tool_output_contains_media(&data, ToolMediaScope::ImagesOnly));
-        assert!(!tool_output_contains_media(&remote, ToolMediaScope::ImagesOnly));
+        assert!(tool_output_contains_media(
+            &data,
+            ToolMediaScope::ImagesOnly
+        ));
+        assert!(!tool_output_contains_media(
+            &remote,
+            ToolMediaScope::ImagesOnly
+        ));
     }
 
     #[test]
@@ -674,9 +680,18 @@ mod tests {
         let replacement = json!({"type": "text", "text": "moved"});
         let mut media = Vec::new();
 
-        assert!(!tool_output_contains_media(&value, ToolMediaScope::AllSupported));
+        assert!(!tool_output_contains_media(
+            &value,
+            ToolMediaScope::AllSupported
+        ));
         assert_eq!(
-            strip_media_direct(&mut value, &mut media, ToolMediaScope::AllSupported, &replacement, "moved"),
+            strip_media_direct(
+                &mut value,
+                &mut media,
+                ToolMediaScope::AllSupported,
+                &replacement,
+                "moved"
+            ),
             0
         );
         assert!(media.is_empty());
@@ -782,10 +797,22 @@ mod tests {
             "input_audio": {"data": "YWJj", "format": "wav"}
         });
 
-        assert!(!tool_output_contains_media(&file, ToolMediaScope::ImagesOnly));
-        assert!(!tool_output_contains_media(&audio, ToolMediaScope::ImagesOnly));
-        assert!(tool_output_contains_media(&file, ToolMediaScope::AllSupported));
-        assert!(tool_output_contains_media(&audio, ToolMediaScope::AllSupported));
+        assert!(!tool_output_contains_media(
+            &file,
+            ToolMediaScope::ImagesOnly
+        ));
+        assert!(!tool_output_contains_media(
+            &audio,
+            ToolMediaScope::ImagesOnly
+        ));
+        assert!(tool_output_contains_media(
+            &file,
+            ToolMediaScope::AllSupported
+        ));
+        assert!(tool_output_contains_media(
+            &audio,
+            ToolMediaScope::AllSupported
+        ));
     }
 
     #[test]
@@ -868,7 +895,11 @@ mod tests {
         tool_output_contains_media_at_depth(value, scope, 0)
     }
 
-    fn tool_output_contains_media_at_depth(value: &Value, scope: ToolMediaScope, depth: usize) -> bool {
+    fn tool_output_contains_media_at_depth(
+        value: &Value,
+        scope: ToolMediaScope,
+        depth: usize,
+    ) -> bool {
         if depth > MAX_MEDIA_TRAVERSAL_DEPTH {
             return false;
         }

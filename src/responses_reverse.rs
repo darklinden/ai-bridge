@@ -58,10 +58,7 @@ pub fn responses_to_anthropic_request(body: &Value) -> Result<Value, Error> {
     }
 
     // reasoning.effort → thinking
-    if let Some(effort) = body
-        .pointer("/reasoning/effort")
-        .and_then(Value::as_str)
-    {
+    if let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
         match effort.to_ascii_lowercase().as_str() {
             "none" => {
                 result["thinking"] = json!({ "type": "disabled" });
@@ -91,10 +88,7 @@ pub fn responses_to_anthropic_request(body: &Value) -> Result<Value, Error> {
     }
 
     // parallel_tool_calls=false → tool_choice.disable_parallel_tool_use
-    let disable_parallel = body
-        .get("parallel_tool_calls")
-        .and_then(Value::as_bool)
-        == Some(false);
+    let disable_parallel = body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false);
     // tool_choice: Responses uses {type: "auto"|"required"|"none"|"function", name}
     if let Some(tc) = body.get("tool_choice") {
         if let Some(mapped) = map_responses_tool_choice(tc) {
@@ -147,7 +141,9 @@ fn responses_input_to_messages(input: &[Value]) -> Result<Vec<Value>, Error> {
                             "input_image" => {
                                 if let Some(url) = block.get("image_url").and_then(Value::as_str) {
                                     if url.starts_with("data:") {
-                                        if let Some((mt, data)) = crate::convert_reverse::parse_data_url_pub(url) {
+                                        if let Some((mt, data)) =
+                                            crate::convert_reverse::parse_data_url_pub(url)
+                                        {
                                             content_blocks.push(json!({
                                                 "type":"image",
                                                 "source":{"type":"base64","media_type":mt,"data":data}
@@ -159,8 +155,12 @@ fn responses_input_to_messages(input: &[Value]) -> Result<Vec<Value>, Error> {
                                             "source":{"type":"url","url":url}
                                         }));
                                     }
-                                } else if let Some(data) = block.get("data").and_then(Value::as_str) {
-                                    let mt = block.get("media_type").and_then(Value::as_str).unwrap_or("image/jpeg");
+                                } else if let Some(data) = block.get("data").and_then(Value::as_str)
+                                {
+                                    let mt = block
+                                        .get("media_type")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("image/jpeg");
                                     content_blocks.push(json!({
                                         "type":"image",
                                         "source":{"type":"base64","media_type":mt,"data":data}
@@ -265,7 +265,10 @@ pub fn anthropic_to_responses_response(body: &Value, model: &str) -> Result<Valu
                 "thinking" => {
                     // thinking → reasoning item (opaque summary).
                     let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or("");
-                    let summary = block.get("signature").map(|_| json!({})).unwrap_or(json!({}));
+                    let summary = block
+                        .get("signature")
+                        .map(|_| json!({}))
+                        .unwrap_or(json!({}));
                     output.push(json!({
                         "id": format!("rs_{}", output.len()),
                         "type": "reasoning",
@@ -712,7 +715,9 @@ mod tests {
     /// is dropped).
     async fn run_responses_sse(frames: Vec<String>, log_resp: bool) -> Vec<(String, Value)> {
         let upstream = futures::stream::iter(
-            frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
         );
         let out =
             anthropic_to_responses_sse(upstream, "gpt-5".to_string(), ReqLog::new(), log_resp);
@@ -745,11 +750,12 @@ mod tests {
     /// line so the logging side can be asserted.
     async fn run_responses_sse_logged(frames: Vec<String>, log_resp: bool) -> String {
         let upstream = futures::stream::iter(
-            frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
         );
         let (reqlog, captured) = ReqLog::captured();
-        let out =
-            anthropic_to_responses_sse(upstream, "gpt-5".to_string(), reqlog, log_resp);
+        let out = anthropic_to_responses_sse(upstream, "gpt-5".to_string(), reqlog, log_resp);
         let _chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
         let logged = captured.lock().unwrap().clone();
         logged
@@ -820,11 +826,21 @@ mod tests {
         assert_eq!(result["object"], "response");
         assert_eq!(result["status"], "in_progress");
         // message item
-        let msg_item = result["output"].as_array().unwrap().iter().find(|i| i["type"] == "message").unwrap();
+        let msg_item = result["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "message")
+            .unwrap();
         assert_eq!(msg_item["content"][0]["type"], "output_text");
         assert_eq!(msg_item["content"][0]["text"], "hello");
         // function_call item
-        let fc = result["output"].as_array().unwrap().iter().find(|i| i["type"] == "function_call").unwrap();
+        let fc = result["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .unwrap();
         assert_eq!(fc["name"], "get_weather");
         assert_eq!(fc["arguments"], "{\"city\":\"SF\"}");
     }
@@ -899,7 +915,9 @@ mod tests {
 
         let fc = out
             .iter()
-            .find(|(e, v)| e == "response.output_item.added" && v["item"]["type"] == "function_call")
+            .find(|(e, v)| {
+                e == "response.output_item.added" && v["item"]["type"] == "function_call"
+            })
             .map(|(_, v)| v.clone())
             .expect("function_call item emitted");
         assert_eq!(fc["item"]["name"], "get_weather");

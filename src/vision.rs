@@ -51,10 +51,9 @@ fn image_fingerprint(block: &Value) -> Option<u64> {
                 .map(str::as_bytes)
         })?;
     // FNV-1a 64-bit — cheap and good enough for cache keying.
-    Some(
-        data.iter()
-            .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)),
-    )
+    Some(data.iter().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ *b as u64).wrapping_mul(0x100000001b3)
+    }))
 }
 
 /// Read a cached description, if present and not expired.
@@ -62,9 +61,7 @@ fn cache_get(fingerprint: u64) -> Option<String> {
     let mut guard = CACHE.lock().unwrap();
     let cache = guard.as_mut()?;
     match cache.get(&fingerprint) {
-        Some(entry) if entry.expires_at > Instant::now() => {
-            Some(entry.description.clone())
-        }
+        Some(entry) if entry.expires_at > Instant::now() => Some(entry.description.clone()),
         Some(_) => {
             cache.remove(&fingerprint);
             None
@@ -416,10 +413,7 @@ fn select_prompt(vision: &VisionConfig) -> &str {
 }
 
 /// Build a joint vision request describing all images at once.
-fn build_vision_request(
-    uncached: &[(usize, u64, &Value)],
-    vision: &VisionConfig,
-) -> Value {
+fn build_vision_request(uncached: &[(usize, u64, &Value)], vision: &VisionConfig) -> Value {
     let prompt = select_prompt(vision);
     // Prompt text + a `[Image N]` label text part before each image, so the
     // model numbers every section by its TRUE 1-based document position. This
@@ -561,7 +555,6 @@ async fn call_vision(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,7 +629,8 @@ mod tests {
         assert!(fps[0].is_some());
         assert_eq!(images[0]["type"], "image_url");
 
-        let handled = replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(1));
+        let handled =
+            replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(1));
         assert_eq!(handled, 1);
 
         let content = &body["messages"][0]["content"][0]["content"];
@@ -654,7 +648,8 @@ mod tests {
             {"type": "tool_result", "tool_use_id": "toolu_1", "content": inner}
         ]));
 
-        let handled = replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(1));
+        let handled =
+            replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(1));
         assert_eq!(handled, 1);
 
         let rewritten = body["messages"][0]["content"][0]["content"]
@@ -678,9 +673,12 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0]["image_url"]["url"], big_data_url());
 
-        let handled = replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(1));
+        let handled =
+            replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(1));
         assert_eq!(handled, 1);
-        let content = body["messages"][0]["content"][0]["content"].as_str().unwrap();
+        let content = body["messages"][0]["content"][0]["content"]
+            .as_str()
+            .unwrap();
         assert_eq!(content, "description 0");
         assert!(!content.contains("base64"));
     }
@@ -691,11 +689,8 @@ mod tests {
             {"type": "tool_result", "tool_use_id": "toolu_1", "content": [image_block()]}
         ]));
 
-        let handled = replace_images_with_descriptions(
-            &mut body,
-            LocalEntry::AnthropicMessages,
-            &[None],
-        );
+        let handled =
+            replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &[None]);
         assert_eq!(handled, 1);
         let content = &body["messages"][0]["content"][0]["content"];
         assert_eq!(content[0]["type"], "text");
@@ -723,13 +718,17 @@ mod tests {
         let (images, _) = collect_image_slots(&body, LocalEntry::AnthropicMessages);
         assert_eq!(images.len(), 3);
 
-        let handled = replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(3));
+        let handled =
+            replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(3));
         assert_eq!(handled, 3);
 
         // Top-level slot 0 → description 0.
         assert_eq!(body["messages"][0]["content"][0]["text"], "description 0");
         // Tool_result slot 1 → description 1.
-        assert_eq!(body["messages"][1]["content"][0]["content"][0]["text"], "description 1");
+        assert_eq!(
+            body["messages"][1]["content"][0]["content"][0]["text"],
+            "description 1"
+        );
         // Top-level slot 2 → description 2.
         assert_eq!(body["messages"][2]["content"][0]["text"], "description 2");
     }
@@ -746,7 +745,8 @@ mod tests {
         assert!(fps.is_empty());
 
         let mut mutated = body.clone();
-        let handled = replace_images_with_descriptions(&mut mutated, LocalEntry::AnthropicMessages, &[]);
+        let handled =
+            replace_images_with_descriptions(&mut mutated, LocalEntry::AnthropicMessages, &[]);
         assert_eq!(handled, 0);
         assert_eq!(mutated.to_string(), original);
     }
@@ -764,7 +764,8 @@ mod tests {
         let (images, _) = collect_image_slots(&body, LocalEntry::AnthropicMessages);
         assert!(images.is_empty());
 
-        let handled = replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &[]);
+        let handled =
+            replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &[]);
         assert_eq!(handled, 0);
         assert_eq!(body.to_string(), original);
     }
@@ -789,8 +790,7 @@ mod tests {
         // The code normalizes string slots to a Chat image_url part before
         // fingerprinting, so the string form and the object form of the same
         // image must share a fingerprint (cache interop).
-        let string_part =
-            crate::tool_media::whole_string_image_data_url(&url).unwrap();
+        let string_part = crate::tool_media::whole_string_image_data_url(&url).unwrap();
         let object_part = image_url_object(&url);
 
         let fp_str = image_fingerprint(&string_part);
@@ -808,7 +808,8 @@ mod tests {
              "content": [{"type": "text", "text": "screenshot:"}, image_block()]}
         ]));
 
-        let handled = replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(1));
+        let handled =
+            replace_images_with_descriptions(&mut body, LocalEntry::AnthropicMessages, &descs(1));
         assert_eq!(handled, 1);
 
         let chat = crate::convert::anthropic_to_openai_with_reasoning_content(body, true).unwrap();
@@ -820,7 +821,10 @@ mod tests {
         // No synthetic user message carrying tool media was emitted.
         let messages = chat["messages"].as_array().unwrap();
         for m in messages {
-            assert_ne!(m["role"], "user", "synthetic user message leaked: {serialized}");
+            assert_ne!(
+                m["role"], "user",
+                "synthetic user message leaked: {serialized}"
+            );
         }
     }
 

@@ -68,10 +68,11 @@ impl Error {
     pub(crate) fn into_entry_response(self, entry: LocalEntry) -> Response {
         let (status, message) = self.status_and_message();
         match entry {
-            LocalEntry::AnthropicMessages => {
-                (status, Json(json!({ "error": { "type": "error", "message": message } })))
-                    .into_response()
-            }
+            LocalEntry::AnthropicMessages => (
+                status,
+                Json(json!({ "error": { "type": "error", "message": message } })),
+            )
+                .into_response(),
             LocalEntry::OaiChat | LocalEntry::OaiResponses => {
                 let error_type = if status == StatusCode::BAD_REQUEST {
                     "invalid_request_error"

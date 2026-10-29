@@ -74,8 +74,7 @@ fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new_bytes: &[u
                 let valid_up_to = e.valid_up_to();
                 if valid_up_to > 0 {
                     buffer.push_str(
-                        std::str::from_utf8(&input[pos..pos + valid_up_to])
-                            .unwrap_or(""),
+                        std::str::from_utf8(&input[pos..pos + valid_up_to]).unwrap_or(""),
                     );
                     pos += valid_up_to;
                 }
@@ -1026,14 +1025,23 @@ mod tests {
 
         assert_eq!(events[0].1["message"]["id"], "resp_1");
         assert_eq!(events[0].1["message"]["model"], "gpt-4o");
-        assert_eq!(events[0].1["message"]["usage"], json!({"input_tokens": 0, "output_tokens": 0}));
+        assert_eq!(
+            events[0].1["message"]["usage"],
+            json!({"input_tokens": 0, "output_tokens": 0})
+        );
 
         assert_eq!(events[1].1["index"], 0);
         assert_eq!(events[1].1["content_block"]["type"], "text");
         assert_eq!(events[2].1["index"], 0);
-        assert_eq!(events[2].1["delta"], json!({"type": "text_delta", "text": "Hello"}));
+        assert_eq!(
+            events[2].1["delta"],
+            json!({"type": "text_delta", "text": "Hello"})
+        );
 
-        assert_eq!(events[4].1["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+        assert_eq!(
+            events[4].1["usage"],
+            json!({"input_tokens": 10, "output_tokens": 5})
+        );
         assert!(events[4].1["delta"]["stop_reason"].is_null());
     }
 
@@ -1108,7 +1116,10 @@ mod tests {
         .await;
 
         let names = event_names(&events);
-        assert_eq!(names, vec!["message_start", "message_delta", "message_stop"]);
+        assert_eq!(
+            names,
+            vec!["message_start", "message_delta", "message_stop"]
+        );
     }
 
     #[tokio::test]
@@ -1271,10 +1282,16 @@ mod tests {
         .await;
 
         let names = event_names(&events);
-        assert_eq!(names, vec!["message_start", "message_delta", "message_stop"]);
+        assert_eq!(
+            names,
+            vec!["message_start", "message_delta", "message_stop"]
+        );
         let md = events.iter().find(|(e, _)| e == "message_delta").unwrap();
         assert_eq!(md.1["delta"]["stop_reason"], "max_tokens");
-        assert_eq!(md.1["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+        assert_eq!(
+            md.1["usage"],
+            json!({"input_tokens": 10, "output_tokens": 5})
+        );
     }
 
     #[tokio::test]
@@ -1299,7 +1316,12 @@ mod tests {
         let names = event_names(&events);
         assert_eq!(
             names,
-            vec!["message_start", "content_block_start", "content_block_delta", "error"]
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "error"
+            ]
         );
         assert_eq!(events[3].1["error"]["type"], "api_error");
         assert_eq!(events[3].1["error"]["message"], "boom");
@@ -1340,15 +1362,19 @@ mod tests {
 
         // The whitespace-only delta must be suppressed by the guard; the block
         // is still closed normally.
-        assert!(
-            !events
-                .iter()
-                .any(|(e, d)| e == "content_block_delta" && d["delta"]["type"] == "input_json_delta")
-        );
+        assert!(!events
+            .iter()
+            .any(|(e, d)| e == "content_block_delta" && d["delta"]["type"] == "input_json_delta"));
         let names = event_names(&events);
         assert_eq!(
             names,
-            vec!["message_start", "content_block_start", "content_block_stop", "message_delta", "message_stop"]
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
         );
     }
 
@@ -1417,11 +1443,20 @@ mod tests {
         assert_eq!(events[0].1["message"]["id"], "resp_1"); // 来自 /response/id
         assert_eq!(events[1].1["index"], 0);
         assert_eq!(events[1].1["content_block"]["type"], "text");
-        assert_eq!(events[2].1["delta"], json!({"type": "text_delta", "text": "Hello"}));
-        assert_eq!(events[3].1["delta"], json!({"type": "text_delta", "text": ", world"}));
+        assert_eq!(
+            events[2].1["delta"],
+            json!({"type": "text_delta", "text": "Hello"})
+        );
+        assert_eq!(
+            events[3].1["delta"],
+            json!({"type": "text_delta", "text": ", world"})
+        );
         assert_eq!(events[4].1["index"], 0);
         // usage 来自 /response/usage
-        assert_eq!(events[5].1["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+        assert_eq!(
+            events[5].1["usage"],
+            json!({"input_tokens": 10, "output_tokens": 5})
+        );
         assert!(events[5].1["delta"]["stop_reason"].is_null());
     }
 
@@ -1676,7 +1711,10 @@ mod tests {
             ),
         ])
         .await;
-        assert!(logged.contains("[tool_use: f] {\"a\":1}"), "log was: {logged}");
+        assert!(
+            logged.contains("[tool_use: f] {\"a\":1}"),
+            "log was: {logged}"
+        );
     }
 
     #[tokio::test]

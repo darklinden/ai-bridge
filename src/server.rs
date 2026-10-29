@@ -75,7 +75,10 @@ fn tool_use_summary(block: &Value) -> String {
 /// content (string, or flattened text/tool blocks), no truncation and no
 /// folding — the tool's output is written as it came, newlines included.
 fn tool_result_summary(block: &Value) -> String {
-    let id = block.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("?");
+    let id = block
+        .get("tool_use_id")
+        .and_then(|i| i.as_str())
+        .unwrap_or("?");
     // A missing/null payload degrades to the bare marker, the same rule the
     // Chat/Responses path applies in `tool_result_text`.
     let content = match block.get("content") {
@@ -336,7 +339,9 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(handle_chat_completions_local))
         .route("/v1/responses", post(handle_responses_local))
         .layer(CorsLayer::permissive())
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(200 * 1024 * 1024)) // 200 MB
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            200 * 1024 * 1024,
+        )) // 200 MB
         .with_state(state)
 }
 
@@ -582,11 +587,10 @@ async fn preprocess_media(
         return Ok(0);
     }
     match &state.config.vision {
-        Some(vision) => {
-            crate::vision::describe_images_in_body(body, entry, state, vision).await
-        }
+        Some(vision) => crate::vision::describe_images_in_body(body, entry, state, vision).await,
         None => Ok(crate::media_sanitizer::replace_images_for_text_only_model(
-            body, &state.config.model,
+            body,
+            &state.config.model,
         )),
     }
 }
@@ -623,45 +627,56 @@ async fn handle_messages(
 ) -> Result<Response<Body>, Error> {
     let entry = ANTHROPIC_ENTRY;
     let result: Result<Response<Body>, Error> = async {
-    authenticate(&headers, state.config.auth_key.as_deref())?;
+        authenticate(&headers, state.config.auth_key.as_deref())?;
 
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let model = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string();
 
-    let media_handled = preprocess_media(&mut body, ANTHROPIC_ENTRY, &state).await?;
-    let reqlog = setup_reqlog(&body, ANTHROPIC_ENTRY, &model);
-    if media_handled > 0 {
-        reqlog.append_media_note(&format!(
-            " [media: {media_handled} image(s) → {}]",
-            crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
-        ));
-    }
-
-    // Always override the outgoing model with the configured upstream model.
-    body["model"] = json!(state.config.model.clone());
-
-    let upstream = UpstreamTarget::from(&state.config);
-
-    match state.config.upstream_type {
-        UpstreamType::OaiChat => {
-            handle_anthropic_entry_to_chat(state, body, is_stream, &model, &reqlog, upstream).await
+        let media_handled = preprocess_media(&mut body, ANTHROPIC_ENTRY, &state).await?;
+        let reqlog = setup_reqlog(&body, ANTHROPIC_ENTRY, &model);
+        if media_handled > 0 {
+            reqlog.append_media_note(&format!(
+                " [media: {media_handled} image(s) → {}]",
+                crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
+            ));
         }
-        UpstreamType::OaiResponses => {
-            handle_anthropic_entry_to_responses(state, body, is_stream, &model, &reqlog, upstream)
+
+        // Always override the outgoing model with the configured upstream model.
+        body["model"] = json!(state.config.model.clone());
+
+        let upstream = UpstreamTarget::from(&state.config);
+
+        match state.config.upstream_type {
+            UpstreamType::OaiChat => {
+                handle_anthropic_entry_to_chat(state, body, is_stream, &model, &reqlog, upstream)
+                    .await
+            }
+            UpstreamType::OaiResponses => {
+                handle_anthropic_entry_to_responses(
+                    state, body, is_stream, &model, &reqlog, upstream,
+                )
                 .await
-        }
-        UpstreamType::AnthropicMessages => {
-            handle_passthrough(state, body, is_stream, &model, &reqlog, upstream, ANTHROPIC_ENTRY)
+            }
+            UpstreamType::AnthropicMessages => {
+                handle_passthrough(
+                    state,
+                    body,
+                    is_stream,
+                    &model,
+                    &reqlog,
+                    upstream,
+                    ANTHROPIC_ENTRY,
+                )
                 .await
+            }
         }
-    }
     }
     .await;
     match result {
@@ -678,43 +693,48 @@ async fn handle_chat_completions_local(
 ) -> Result<Response<Body>, Error> {
     let entry = CHAT_ENTRY;
     let result: Result<Response<Body>, Error> = async {
-    authenticate(&headers, state.config.auth_key.as_deref())?;
+        authenticate(&headers, state.config.auth_key.as_deref())?;
 
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let model = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string();
 
-    let media_handled = preprocess_media(&mut body, CHAT_ENTRY, &state).await?;
-    let reqlog = setup_reqlog(&body, CHAT_ENTRY, &model);
-    if media_handled > 0 {
-        reqlog.append_media_note(&format!(
-            " [media: {media_handled} image(s) → {}]",
-            crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
-        ));
-    }
-
-    body["model"] = json!(state.config.model.clone());
-
-    let upstream = UpstreamTarget::from(&state.config);
-
-    match state.config.upstream_type {
-        UpstreamType::OaiChat => {
-            handle_passthrough(state, body, is_stream, &model, &reqlog, upstream, CHAT_ENTRY).await
+        let media_handled = preprocess_media(&mut body, CHAT_ENTRY, &state).await?;
+        let reqlog = setup_reqlog(&body, CHAT_ENTRY, &model);
+        if media_handled > 0 {
+            reqlog.append_media_note(&format!(
+                " [media: {media_handled} image(s) → {}]",
+                crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
+            ));
         }
-        UpstreamType::OaiResponses => {
-            // chat request → responses request, responses response → chat response.
-            handle_chat_entry_to_responses(state, body, is_stream, &model, &reqlog, upstream).await
+
+        body["model"] = json!(state.config.model.clone());
+
+        let upstream = UpstreamTarget::from(&state.config);
+
+        match state.config.upstream_type {
+            UpstreamType::OaiChat => {
+                handle_passthrough(
+                    state, body, is_stream, &model, &reqlog, upstream, CHAT_ENTRY,
+                )
+                .await
+            }
+            UpstreamType::OaiResponses => {
+                // chat request → responses request, responses response → chat response.
+                handle_chat_entry_to_responses(state, body, is_stream, &model, &reqlog, upstream)
+                    .await
+            }
+            UpstreamType::AnthropicMessages => {
+                handle_chat_entry_to_anthropic(state, body, is_stream, &model, &reqlog, upstream)
+                    .await
+            }
         }
-        UpstreamType::AnthropicMessages => {
-            handle_chat_entry_to_anthropic(state, body, is_stream, &model, &reqlog, upstream).await
-        }
-    }
     }
     .await;
     match result {
@@ -731,45 +751,56 @@ async fn handle_responses_local(
 ) -> Result<Response<Body>, Error> {
     let entry = RESPONSES_ENTRY;
     let result: Result<Response<Body>, Error> = async {
-    authenticate(&headers, state.config.auth_key.as_deref())?;
+        authenticate(&headers, state.config.auth_key.as_deref())?;
 
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let model = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string();
 
-    let media_handled = preprocess_media(&mut body, RESPONSES_ENTRY, &state).await?;
-    let reqlog = setup_reqlog(&body, RESPONSES_ENTRY, &model);
-    if media_handled > 0 {
-        reqlog.append_media_note(&format!(
-            " [media: {media_handled} image(s) → {}]",
-            crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
-        ));
-    }
+        let media_handled = preprocess_media(&mut body, RESPONSES_ENTRY, &state).await?;
+        let reqlog = setup_reqlog(&body, RESPONSES_ENTRY, &model);
+        if media_handled > 0 {
+            reqlog.append_media_note(&format!(
+                " [media: {media_handled} image(s) → {}]",
+                crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
+            ));
+        }
 
-    body["model"] = json!(state.config.model.clone());
+        body["model"] = json!(state.config.model.clone());
 
-    let upstream = UpstreamTarget::from(&state.config);
+        let upstream = UpstreamTarget::from(&state.config);
 
-    match state.config.upstream_type {
-        UpstreamType::OaiResponses => {
-            handle_passthrough(state, body, is_stream, &model, &reqlog, upstream, RESPONSES_ENTRY)
+        match state.config.upstream_type {
+            UpstreamType::OaiResponses => {
+                handle_passthrough(
+                    state,
+                    body,
+                    is_stream,
+                    &model,
+                    &reqlog,
+                    upstream,
+                    RESPONSES_ENTRY,
+                )
                 .await
-        }
-        UpstreamType::OaiChat => {
-            // responses request → chat request, chat response → responses response.
-            handle_responses_entry_to_chat(state, body, is_stream, &model, &reqlog, upstream).await
-        }
-        UpstreamType::AnthropicMessages => {
-            handle_responses_entry_to_anthropic(state, body, is_stream, &model, &reqlog, upstream)
+            }
+            UpstreamType::OaiChat => {
+                // responses request → chat request, chat response → responses response.
+                handle_responses_entry_to_chat(state, body, is_stream, &model, &reqlog, upstream)
+                    .await
+            }
+            UpstreamType::AnthropicMessages => {
+                handle_responses_entry_to_anthropic(
+                    state, body, is_stream, &model, &reqlog, upstream,
+                )
                 .await
+            }
         }
-    }
     }
     .await;
     match result {
@@ -801,16 +832,11 @@ async fn handle_passthrough(
         wants_reasoning,
     );
     if is_stream {
-        let upstream_resp = match crate::forward::forward_to_zen_streaming(
-            body,
-            &state.client,
-            &upstream,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, entry)),
-        };
+        let upstream_resp =
+            match crate::forward::forward_to_zen_streaming(body, &state.client, &upstream).await {
+                Ok(r) => r,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, entry)),
+            };
         let stream = upstream_resp.bytes_stream();
         // Log the streamed response text onto the `[RESP]` line while forwarding
         // the bytes verbatim (the local entry and upstream share a wire format).
@@ -821,14 +847,11 @@ async fn handle_passthrough(
         );
         Ok(sse_response(Body::from_stream(stream)))
     } else {
-        let upstream_resp = match crate::forward::forward_to_zen(
-            body, &state.client, &upstream,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, entry)),
-        };
+        let upstream_resp =
+            match crate::forward::forward_to_zen(body, &state.client, &upstream).await {
+                Ok(v) => v,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, entry)),
+            };
         let text = match entry {
             LocalEntry::AnthropicMessages => anthropic_resp_text(&upstream_resp),
             LocalEntry::OaiChat => chat_resp_text(&upstream_resp),
@@ -862,28 +885,23 @@ async fn handle_anthropic_entry_to_chat(
     convert::inject_openai_stream_include_usage(&mut chat_body);
 
     if is_stream {
-        let upstream_resp = match crate::forward::forward_to_zen_streaming(
-            chat_body,
-            &state.client,
-            &upstream,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
-        };
+        let upstream_resp =
+            match crate::forward::forward_to_zen_streaming(chat_body, &state.client, &upstream)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
+            };
         let stream = upstream_resp.bytes_stream();
-        let anthropic_stream = convert::chat_to_anthropic_sse(stream, model.to_string(), reqlog.clone());
+        let anthropic_stream =
+            convert::chat_to_anthropic_sse(stream, model.to_string(), reqlog.clone());
         Ok(sse_response(Body::from_stream(anthropic_stream)))
     } else {
-        let upstream_resp = match crate::forward::forward_to_zen(
-            chat_body, &state.client, &upstream,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
-        };
+        let upstream_resp =
+            match crate::forward::forward_to_zen(chat_body, &state.client, &upstream).await {
+                Ok(v) => v,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
+            };
         let anthropic_response = match convert::openai_to_anthropic(upstream_resp, model) {
             Ok(v) => v,
             Err(e) => {
@@ -941,23 +959,21 @@ async fn handle_anthropic_entry_to_responses(
         );
         Ok(sse_response(Body::from_stream(anthropic_stream)))
     } else {
-        let upstream_resp = match crate::forward::forward_to_responses(
-            responses_body, &state.client, &upstream,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
-        };
-        let anthropic_response = match transform_responses::responses_to_anthropic(
-            upstream_resp, model,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
-        };
+        let upstream_resp =
+            match crate::forward::forward_to_responses(responses_body, &state.client, &upstream)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, ANTHROPIC_ENTRY)),
+            };
+        let anthropic_response =
+            match transform_responses::responses_to_anthropic(upstream_resp, model) {
+                Ok(v) => v,
+                Err(e) => {
+                    reqlog.err_req(&e.to_string());
+                    return Err(e);
+                }
+            };
         let stop_reason = anthropic_response
             .get("stop_reason")
             .and_then(|r| r.as_str())
@@ -1014,15 +1030,13 @@ async fn handle_chat_entry_to_anthropic(
         );
         Ok(sse_response(Body::from_stream(chat_stream)))
     } else {
-        let upstream_resp = match crate::forward::forward_to_zen(
-            anthropic_body, &state.client, &upstream,
-        )
-        .await
+        let upstream_resp =
+            match crate::forward::forward_to_zen(anthropic_body, &state.client, &upstream).await {
+                Ok(v) => v,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, CHAT_ENTRY)),
+            };
+        let chat_response = match convert_reverse::anthropic_to_chat_response(&upstream_resp, model)
         {
-            Ok(v) => v,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, CHAT_ENTRY)),
-        };
-        let chat_response = match convert_reverse::anthropic_to_chat_response(&upstream_resp, model) {
             Ok(v) => v,
             Err(e) => {
                 reqlog.err_req(&e.to_string());
@@ -1075,8 +1089,11 @@ async fn handle_chat_entry_to_responses(
         };
         let stream = upstream_resp.bytes_stream();
         // responses SSE → anthropic SSE → chat SSE (double bridge).
-        let anthropic_stream =
-            crate::streaming_responses::responses_to_anthropic_sse(stream, model.to_string(), reqlog.clone());
+        let anthropic_stream = crate::streaming_responses::responses_to_anthropic_sse(
+            stream,
+            model.to_string(),
+            reqlog.clone(),
+        );
         let chat_stream = convert_reverse::anthropic_to_chat_sse(
             anthropic_stream,
             model.to_string(),
@@ -1085,23 +1102,23 @@ async fn handle_chat_entry_to_responses(
         );
         Ok(sse_response(Body::from_stream(chat_stream)))
     } else {
-        let upstream_resp = match crate::forward::forward_to_responses(
-            responses_body, &state.client, &upstream,
-        )
-        .await
+        let upstream_resp =
+            match crate::forward::forward_to_responses(responses_body, &state.client, &upstream)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, CHAT_ENTRY)),
+            };
+        let anthropic_mid = match transform_responses::responses_to_anthropic(upstream_resp, model)
         {
             Ok(v) => v,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, CHAT_ENTRY)),
+            Err(e) => {
+                reqlog.err_req(&e.to_string());
+                return Err(e);
+            }
         };
-        let anthropic_mid =
-            match transform_responses::responses_to_anthropic(upstream_resp, model) {
-                Ok(v) => v,
-                Err(e) => {
-                    reqlog.err_req(&e.to_string());
-                    return Err(e);
-                }
-            };
-        let chat_response = match convert_reverse::anthropic_to_chat_response(&anthropic_mid, model) {
+        let chat_response = match convert_reverse::anthropic_to_chat_response(&anthropic_mid, model)
+        {
             Ok(v) => v,
             Err(e) => {
                 reqlog.err_req(&e.to_string());
@@ -1157,24 +1174,23 @@ async fn handle_responses_entry_to_anthropic(
         );
         Ok(sse_response(Body::from_stream(responses_stream)))
     } else {
-        let upstream_resp = match crate::forward::forward_to_zen(
-            anthropic_body, &state.client, &upstream,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
-        };
-        let responses_response = match responses_reverse::anthropic_to_responses_response(
-            &upstream_resp, model,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                reqlog.err_req(&e.to_string());
-                return Err(e);
-            }
-        };
-        reqlog.resp(&resp_summary("ok", &responses_resp_text(&responses_response)));
+        let upstream_resp =
+            match crate::forward::forward_to_zen(anthropic_body, &state.client, &upstream).await {
+                Ok(v) => v,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
+            };
+        let responses_response =
+            match responses_reverse::anthropic_to_responses_response(&upstream_resp, model) {
+                Ok(v) => v,
+                Err(e) => {
+                    reqlog.err_req(&e.to_string());
+                    return Err(e);
+                }
+            };
+        reqlog.resp(&resp_summary(
+            "ok",
+            &responses_resp_text(&responses_response),
+        ));
         Ok(Json(responses_response).into_response())
     }
 }
@@ -1207,16 +1223,13 @@ async fn handle_responses_entry_to_chat(
     convert::inject_openai_stream_include_usage(&mut chat_body);
 
     if is_stream {
-        let upstream_resp = match crate::forward::forward_to_zen_streaming(
-            chat_body,
-            &state.client,
-            &upstream,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
-        };
+        let upstream_resp =
+            match crate::forward::forward_to_zen_streaming(chat_body, &state.client, &upstream)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
+            };
         let stream = upstream_resp.bytes_stream();
         // chat SSE → anthropic SSE → responses SSE.
         let anthropic_stream =
@@ -1229,14 +1242,11 @@ async fn handle_responses_entry_to_chat(
         );
         Ok(sse_response(Body::from_stream(responses_stream)))
     } else {
-        let upstream_resp = match crate::forward::forward_to_zen(
-            chat_body, &state.client, &upstream,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
-        };
+        let upstream_resp =
+            match crate::forward::forward_to_zen(chat_body, &state.client, &upstream).await {
+                Ok(v) => v,
+                Err(e) => return Ok(handle_forward_error(reqlog, e, RESPONSES_ENTRY)),
+            };
         let anthropic_mid = match convert::openai_to_anthropic(upstream_resp, model) {
             Ok(v) => v,
             Err(e) => {
@@ -1252,7 +1262,10 @@ async fn handle_responses_entry_to_chat(
                     return Err(e);
                 }
             };
-        reqlog.resp(&resp_summary("ok", &responses_resp_text(&responses_response)));
+        reqlog.resp(&resp_summary(
+            "ok",
+            &responses_resp_text(&responses_response),
+        ));
         Ok(Json(responses_response).into_response())
     }
 }
@@ -1260,7 +1273,10 @@ async fn handle_responses_entry_to_chat(
 /// Build a `text/event-stream` response from a byte stream.
 fn sse_response(stream: Body) -> Response<Body> {
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/event-stream"),
+    );
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
     (headers, stream).into_response()
 }
@@ -1303,7 +1319,11 @@ fn upstream_error_response(status: StatusCode, body: Value, entry: LocalEntry) -
 /// `into_entry_response`.
 fn handle_forward_error(reqlog: &Arc<ReqLog>, e: Error, entry: LocalEntry) -> Response<Body> {
     match e {
-        Error::Upstream { status, reason, body } => {
+        Error::Upstream {
+            status,
+            reason,
+            body,
+        } => {
             reqlog.err_req(&format!("upstream status {}: {reason}", status.as_u16()));
             upstream_error_response(status, body, entry)
         }
@@ -1405,7 +1425,10 @@ mod tests {
     fn anthropic_resp_text_empty_or_no_content_is_empty() {
         assert_eq!(anthropic_resp_text(&json!({"content": []})), "");
         assert_eq!(anthropic_resp_text(&json!({"stop_reason": "end_turn"})), "");
-        assert_eq!(anthropic_resp_text(&json!({"content": [{"type": "image", "source": {}}]})), "");
+        assert_eq!(
+            anthropic_resp_text(&json!({"content": [{"type": "image", "source": {}}]})),
+            ""
+        );
     }
 
     #[test]
@@ -1458,10 +1481,7 @@ mod tests {
                 }
             }]
         });
-        assert_eq!(
-            chat_resp_text(&body),
-            "let me think (thinking) hello"
-        );
+        assert_eq!(chat_resp_text(&body), "let me think (thinking) hello");
     }
 
     #[test]
@@ -1585,7 +1605,10 @@ mod tests {
     fn resp_summary_appends_text_only_when_present() {
         assert_eq!(resp_summary("ok", ""), "ok");
         assert_eq!(resp_summary("ok", "hello"), "ok hello");
-        assert_eq!(resp_summary("stop_reason=end_turn", "hi"), "stop_reason=end_turn hi");
+        assert_eq!(
+            resp_summary("stop_reason=end_turn", "hi"),
+            "stop_reason=end_turn hi"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1662,13 +1685,19 @@ mod tests {
     fn single_line_collapses_whitespace() {
         assert_eq!(single_line("a  b\nc\td"), "a b c d");
         assert_eq!(single_line(""), "");
-        assert_eq!(single_line("  leading and trailing  "), "leading and trailing");
+        assert_eq!(
+            single_line("  leading and trailing  "),
+            "leading and trailing"
+        );
         assert_eq!(single_line("already"), "already");
     }
 
     #[test]
     fn tool_use_summary_variants() {
-        assert_eq!(tool_use_summary(&json!({"name": "f", "input": {}})), "[tool_use: f] {}");
+        assert_eq!(
+            tool_use_summary(&json!({"name": "f", "input": {}})),
+            "[tool_use: f] {}"
+        );
         assert_eq!(tool_use_summary(&json!({"name": "f"})), "[tool_use: f]");
         assert_eq!(
             tool_use_summary(&json!({"name": "f", "input": {"a": 1}})),
@@ -1676,7 +1705,10 @@ mod tests {
         );
         assert_eq!(tool_use_summary(&json!({"input": {}})), "[tool_use: ?] {}");
         // Empty-string input serializes to `""` (non-empty), so it is appended.
-        assert_eq!(tool_use_summary(&json!({"name": "f", "input": ""})), "[tool_use: f] \"\"");
+        assert_eq!(
+            tool_use_summary(&json!({"name": "f", "input": ""})),
+            "[tool_use: f] \"\""
+        );
     }
 
     #[test]
@@ -1893,7 +1925,10 @@ mod tests {
                 {"role": "user", "content": "hi there"}
             ]
         });
-        assert_eq!(request_text_for_entry(&chat, LocalEntry::OaiChat), "hi there");
+        assert_eq!(
+            request_text_for_entry(&chat, LocalEntry::OaiChat),
+            "hi there"
+        );
 
         let responses = json!({
             "input": [
@@ -2066,31 +2101,61 @@ mod tests {
     fn reasoning_requested_for_entry_variants() {
         // Anthropic entry: thinking_requested semantics.
         let enabled = json!({"thinking": {"type": "enabled", "budget_tokens": 32000}});
-        assert!(reasoning_requested_for_entry(&enabled, LocalEntry::AnthropicMessages));
+        assert!(reasoning_requested_for_entry(
+            &enabled,
+            LocalEntry::AnthropicMessages
+        ));
         let adaptive = json!({"thinking": {"type": "adaptive"}});
-        assert!(reasoning_requested_for_entry(&adaptive, LocalEntry::AnthropicMessages));
+        assert!(reasoning_requested_for_entry(
+            &adaptive,
+            LocalEntry::AnthropicMessages
+        ));
         let disabled = json!({"thinking": {"type": "disabled"}});
-        assert!(!reasoning_requested_for_entry(&disabled, LocalEntry::AnthropicMessages));
+        assert!(!reasoning_requested_for_entry(
+            &disabled,
+            LocalEntry::AnthropicMessages
+        ));
         let absent = json!({"messages": []});
-        assert!(!reasoning_requested_for_entry(&absent, LocalEntry::AnthropicMessages));
+        assert!(!reasoning_requested_for_entry(
+            &absent,
+            LocalEntry::AnthropicMessages
+        ));
         let output_cfg = json!({"output_config": {"effort": "low"}});
-        assert!(reasoning_requested_for_entry(&output_cfg, LocalEntry::AnthropicMessages));
+        assert!(reasoning_requested_for_entry(
+            &output_cfg,
+            LocalEntry::AnthropicMessages
+        ));
 
         // Chat entry: reasoning_effort presence, "none" counts as disabled.
         let chat = json!({"reasoning_effort": "high"});
         assert!(reasoning_requested_for_entry(&chat, LocalEntry::OaiChat));
         let chat_none = json!({"reasoning_effort": "none"});
-        assert!(!reasoning_requested_for_entry(&chat_none, LocalEntry::OaiChat));
+        assert!(!reasoning_requested_for_entry(
+            &chat_none,
+            LocalEntry::OaiChat
+        ));
         let chat_empty = json!({});
-        assert!(!reasoning_requested_for_entry(&chat_empty, LocalEntry::OaiChat));
+        assert!(!reasoning_requested_for_entry(
+            &chat_empty,
+            LocalEntry::OaiChat
+        ));
 
         // Responses entry: reasoning.effort.
         let responses = json!({"reasoning": {"effort": "medium", "summary": "auto"}});
-        assert!(reasoning_requested_for_entry(&responses, LocalEntry::OaiResponses));
+        assert!(reasoning_requested_for_entry(
+            &responses,
+            LocalEntry::OaiResponses
+        ));
         let responses_none = json!({"reasoning": {"effort": "none"}});
-        assert!(!reasoning_requested_for_entry(&responses_none, LocalEntry::OaiResponses));
+        assert!(!reasoning_requested_for_entry(
+            &responses_none,
+            LocalEntry::OaiResponses
+        ));
         let responses_no_effort = json!({"reasoning": {"summary": "auto"}});
-        assert!(!reasoning_requested_for_entry(&responses_no_effort, LocalEntry::OaiResponses));
+        assert!(!reasoning_requested_for_entry(
+            &responses_no_effort,
+            LocalEntry::OaiResponses
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2184,7 +2249,8 @@ mod tests {
     fn handle_forward_error_non_upstream_keeps_old_mapping() {
         let reqlog = ReqLog::new();
         // Non-upstream forward errors still collapse to 502 via into_entry_response.
-        let resp = handle_forward_error(&reqlog, Error::Forward("boom".into()), LocalEntry::OaiChat);
+        let resp =
+            handle_forward_error(&reqlog, Error::Forward("boom".into()), LocalEntry::OaiChat);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 

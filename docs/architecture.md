@@ -23,7 +23,7 @@ local entry ──────────────► upstream
 
 - **Three conversion handlers** — `handle_messages`, `handle_chat_completions_local`, `handle_responses_local`. Each dispatches on `UpstreamType` to the entry × upstream pipeline for its entry.
 - **One pass-through handler** — `handle_passthrough` serves the case where the entry's format already equals the upstream's, so no conversion runs in either direction and the response is re-emitted byte for byte (FR-4). It is a distinct path, not a degenerate conversion: `passthrough_log` exists only to observe this stream. The shared request plumbing still applies, so the forwarded body carries the overridden `model` and the stamped effort — *unconverted*, not untouched.
-- **Per-request plumbing, shared by all entries** — inbound auth against the profile's `auth_key`, unconditional override of `model` to the profile's value, media preprocessing, and error responses shaped to the *local entry* (`Error::into_entry_response`, ADR-0010).
+- **Per-request plumbing, shared by all entries** — inbound auth against the profile's `auth_key`, unconditional override of `model` to the profile's value, media preprocessing, `[extra_body]` injection at the outbound seam, and error responses shaped to the *local entry* (`Error::into_entry_response`, ADR-0010).
 - **Configuration** — `config.rs` discovers profiles and parses TOML into runtime types, including `.settings.toml` bookkeeping; `forward.rs` owns those runtime config types, the outbound HTTP calls, and the reasoning policy; `error.rs` owns error taxonomy and status mapping.
 
 ## 3. Conversion layer

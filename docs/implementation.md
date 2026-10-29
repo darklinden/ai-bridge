@@ -12,11 +12,16 @@ A `/v1/messages` request served by an `oai-chat` upstream:
 4. **Preprocess media** — if the request carries images and the profile has vision enabled, image blocks are replaced by descriptions (see §4).
 5. **Convert the request** — the Anthropic body becomes an OpenAI Chat body.
 6. **Stamp effort** — `forward::apply_reasoning_policy` writes the configured effort value; only *presence* was decided in step 5.
-7. **Forward** — `forward_to_*` performs the outbound HTTP call.
-8. **Convert the response** — non-streaming bodies are translated in place; SSE streams are translated frame by frame as they arrive, with streamed text appended onto the open log line.
-9. **On failure** — the upstream's status and message are relayed inside the local entry's error envelope.
+7. **Merge extra body** — `forward::apply_extra_body` merges the profile's `[extra_body]` fields into the converted body, at the single outbound seam (`build_upstream_request`), so every pipeline inherits them.
+8. **Forward** — `forward_to_*` performs the outbound HTTP call.
+9. **Convert the response** — non-streaming bodies are translated in place; SSE streams are translated frame by frame as they arrive, with streamed text appended onto the open log line.
+10. **On failure** — the upstream's status and message are relayed inside the local entry's error envelope.
 
-The same-format case short-circuits steps 5 and 8: `handle_passthrough` performs no conversion, so the response is re-emitted byte for byte (FR-4).
+The same-format case short-circuits steps 5 and 9: `handle_passthrough` performs no conversion, so the response is re-emitted byte for byte (FR-4).
+
+**Extra body fields.** `[extra_body]` exists so a profile can send vendor-specific extensions the proxy knows nothing about — a gateway's provider pin (`providerOptions.gateway.only`), a Chat upstream's `thinking` object, a `safety_settings` list — without adding a config key per vendor. The table is converted from TOML to JSON at load time and merged at the outbound seam only: handlers never see it, so there is no per-pipeline copy to drift (contrast DEV-8). Merging is recursive — objects are completed key by key, while scalars, arrays and type mismatches replace the existing value — and the configured value always wins. New keys append in a fixed key order, so the same profile serialises identically on every request.
+
+The failure mode to watch is a config that fights the proxy: setting `model`, `stream`, the conversation container, `[reasoning]`'s own fields or `stream_options.include_usage` would either be overwritten after the merge or silently change what the pipeline promised. Those keys are therefore rejected at startup by `config::validate_extra_body`, per upstream format, with the reason text naming where the value really comes from. The table is deliberately **not** applied to `[vision]` requests: that body is a generated describe prompt, and a vendor extension meant for the main model could break it. TOML dates are rejected rather than serialised, because a JSON encoding of `toml::Datetime` is a `$__toml_private_datetime` marker object, not the value the user meant (ADR-0014).
 
 **Log destinations.** The log stream is written to stdout by default; `--log <path>` tees the same lines into an appended file (ADR-0012). Both destinations are fed from the same writer, so the ordering in the file matches the terminal. The file is opened once at startup — an unopenable path fails the launch — and the proxy never rotates it. Because the request log bypasses `tracing` (it appends partial lines, which the line-oriented subscriber cannot do), the tee is the log's own writer, not a second subscriber.
 
@@ -86,6 +91,7 @@ Each invariant states what must hold, how it gets broken, and what currently gua
 | INV-11 | Inbound `auth_key` and upstream `api_key` stay separate credentials | conflating them into one key | two distinct config keys (ADR-0008) |
 | INV-12 | The log observes, it never alters what is forwarded | logging by rewriting a stream instead of teeing it | `passthrough_log` re-yields original chunks (FR-20) |
 | INV-13 | Conversion changes ship with tests | landing a conversion with manual testing only | inline `#[cfg(test)]` convention (FR-9, FR-10) |
+| INV-14 | Profile-supplied outbound fields (`[extra_body]`) are merged at the single outbound seam and never override proxy-owned keys | merging in each handler, or letting a profile set `model`/`stream`/reasoning fields | one merge site in `build_upstream_request`; `config::validate_extra_body` rejects reserved keys at startup (ADR-0014) |
 
 ## 8. Known deviations and open items
 

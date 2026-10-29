@@ -34,7 +34,9 @@ Usage:
 enum Cli {
     /// Serve the named profile; `None` = bare launch, resolved to the
     /// persisted current profile (or `default`) at serve time.
-    Run { profile: Option<String> },
+    Run {
+        profile: Option<String>,
+    },
     List,
     Help,
 }
@@ -111,8 +113,7 @@ async fn run(cli: Cli) -> Result<(), Error> {
     // config directory is located by the platform, not read here (ADR-0005).
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -123,7 +124,9 @@ async fn run(cli: Cli) -> Result<(), Error> {
         }
         // Help is answered synchronously in main(); nothing to do here.
         Cli::Help => Ok(()),
-        Cli::Run { profile: Some(profile) } => run_server(&profile).await,
+        Cli::Run {
+            profile: Some(profile),
+        } => run_server(&profile).await,
         Cli::Run { profile: None } => {
             // Bare launch: serve the recorded current profile (ADR-0007),
             // `default` when nothing has been recorded yet. An invalid or
@@ -183,11 +186,7 @@ async fn run_server(profile: &str) -> Result<(), Error> {
             loaded.name
         );
     }
-    let LoadedProfile {
-        name,
-        path,
-        config,
-    } = loaded;
+    let LoadedProfile { name, path, config } = loaded;
     let state = Arc::new(AppState::new(config)?);
 
     let addr = format!("{}:{}", state.config.listen_addr, state.config.listen_port);
@@ -208,10 +207,7 @@ async fn run_server(profile: &str) -> Result<(), Error> {
         state.config.override_headers.len()
     );
     match &state.config.vision {
-        Some(vision) => println!(
-            "  → vision    = {} (model: {})",
-            vision.url, vision.model
-        ),
+        Some(vision) => println!("  → vision    = {} (model: {})", vision.url, vision.model),
         None => println!("  → vision    = (not configured)"),
     }
     println!(
@@ -296,7 +292,10 @@ mod tests {
         config::save_current_profile(dir.path(), "a").unwrap();
 
         let lines = profile_list_lines(dir.path());
-        assert!(lines.iter().any(|l| l == "  * a"), "a is current: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "  * a"),
+            "a is current: {lines:?}"
+        );
         assert!(lines.iter().any(|l| l == "    b"), "b unmarked: {lines:?}");
     }
 
@@ -309,7 +308,10 @@ mod tests {
 
         let lines = profile_list_lines(dir.path());
         assert!(lines.iter().any(|l| l == "    a"));
-        assert!(!lines.iter().any(|l| l.starts_with("  *")), "no star: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("  *")),
+            "no star: {lines:?}"
+        );
     }
 
     #[test]

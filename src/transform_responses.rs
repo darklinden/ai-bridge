@@ -993,9 +993,7 @@ mod tests {
         });
 
         let error = responses_to_anthropic(input, "").unwrap_err();
-        assert!(
-            matches!(error, Error::Transform(message) if message.contains("backend exploded"))
-        );
+        assert!(matches!(error, Error::Transform(message) if message.contains("backend exploded")));
     }
 
     #[test]
@@ -1079,7 +1077,10 @@ mod tests {
 
         let result = responses_to_anthropic(input, "").unwrap();
         assert_eq!(result["content"][0]["type"], "thinking");
-        assert_eq!(result["content"][0]["thinking"], "Thinking about the problem...");
+        assert_eq!(
+            result["content"][0]["thinking"],
+            "Thinking about the problem..."
+        );
         assert_eq!(result["content"][1]["type"], "text");
         assert_eq!(result["content"][1]["text"], "The answer is 42");
     }

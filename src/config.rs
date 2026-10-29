@@ -95,6 +95,15 @@ const DEFAULT_TEMPLATE: &str = r#"# ai-bridge config profile — this file is au
 #thinking = true       # master switch, default true; when off, all reasoning params are stripped from outbound requests
 #effort = "max"        # default max; off/drop/none/disable/disabled = drop the whole field
 
+# Extra JSON fields merged into every outgoing request body for the main
+# upstream (vendor-specific extensions such as gateway routing). Nested tables
+# merge recursively and win over generated values. Keys the proxy owns are
+# rejected at startup: model, stream, messages, input, plus the format's own
+# reasoning field, stream_options.include_usage, and thinking on
+# anthropic-messages. Not applied to [vision] requests.
+#[extra_body]
+#providerOptions = { gateway = { only = ["deepseek"], has = ["vision", "implicit-caching"] } }
+
 # Vision model (optional): describes images as text before forwarding to a
 # text-only upstream (ADR-0004). Enabled only when url + api_key + model are
 # all set; missing any one disables it with a warning.
@@ -147,7 +156,11 @@ fn config_dir(home: Option<&Path>) -> Result<PathBuf, Error> {
 /// to `[A-Za-z0-9_-]` — this rejects `.`, `..`, path separators and whitespace
 /// outright, making directory escape via a crafted name impossible.
 pub(crate) fn validate_profile_name(name: &str) -> Result<(), Error> {
-    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         Ok(())
     } else {
         Err(Error::Config(format!(
@@ -179,13 +192,19 @@ pub(crate) fn load_profile(base_dir: &Path, name: &str) -> Result<LoadedProfile,
         }
     };
 
-    let raw: RawProfile = toml::from_str(&text).map_err(|e| {
-        Error::Config(format!(
-            "Invalid profile config {}: {e}",
-            path.display()
-        ))
+    let raw: RawProfile = toml::from_str(&text)
+        .map_err(|e| Error::Config(format!("Invalid profile config {}: {e}", path.display())))?;
+    // A build error (bad upstream_type, reserved `[extra_body]` key, unknown
+    // reasoning keyword) also names the file: a bare launch resolves the
+    // profile from `.settings.toml`, so without the path the user cannot tell
+    // which file to edit. `Error`'s Display already prefixes the class, so the
+    // inner message is used directly to avoid "configuration error:" twice.
+    let config = build_config(raw).map_err(|e| match e {
+        Error::Config(msg) => {
+            Error::Config(format!("Invalid profile config {}: {msg}", path.display()))
+        }
+        other => other,
     })?;
-    let config = build_config(raw)?;
 
     Ok(LoadedProfile {
         name: name.to_string(),
@@ -324,6 +343,12 @@ struct RawProfile {
     vision_supplement: Option<bool>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    /// Free-form `[extra_body]` table, merged into every outgoing request body
+    /// for the main upstream (see [`build_extra_body`]). Kept as a
+    /// [`toml::Value`] so any vendor shape is expressible; converted to JSON
+    /// and validated at load time.
+    #[serde(default)]
+    extra_body: Option<toml::Value>,
     #[serde(default)]
     reasoning: Option<RawReasoning>,
     #[serde(default)]
@@ -362,6 +387,7 @@ fn build_config(raw: RawProfile) -> Result<Config, Error> {
     let upstream_type = UpstreamType::parse(&raw.upstream_type)?;
 
     let override_headers = header_overrides_from_pairs("[headers]", raw.headers);
+    let extra_body = build_extra_body(upstream_type, raw.extra_body)?;
 
     // Stringify back into the shared parser so accepted spellings (and the
     // off/drop/none/... keyword set) have a single source of truth.
@@ -380,12 +406,15 @@ fn build_config(raw: RawProfile) -> Result<Config, Error> {
         url: raw.url,
         api_key: raw.api_key,
         model: raw.model.unwrap_or_else(|| DEFAULT_MODEL.into()),
-        listen_addr: raw.listen_addr.unwrap_or_else(|| DEFAULT_LISTEN_ADDR.into()),
+        listen_addr: raw
+            .listen_addr
+            .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.into()),
         listen_port: raw.listen_port.unwrap_or(DEFAULT_LISTEN_PORT),
         // An explicitly empty string stays set (a required empty token),
         // matching the documented caveat of the removed UPSTREAM_AUTH_KEY.
         auth_key: raw.auth_key,
         override_headers,
+        extra_body,
         vision,
         vision_supplement_enabled: raw.vision_supplement.unwrap_or(false),
         reasoning_policy,
@@ -396,6 +425,218 @@ fn build_config(raw: RawProfile) -> Result<Config, Error> {
 /// after trimming.
 fn non_blank(v: Option<&str>) -> Option<&str> {
     v.map(str::trim).filter(|s| !s.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// `[extra_body]` — profile-supplied JSON fields for outgoing requests
+// ---------------------------------------------------------------------------
+
+/// Convert the profile's `[extra_body]` table into the JSON object merged into
+/// every outgoing request body for the main upstream.
+///
+/// The whole mechanism lives at one seam: `forward::build_upstream_request`
+/// merges this value last (after conversion and the reasoning policy), so all
+/// entry × upstream paths inherit it without per-pipeline code. That is why
+/// the keys the proxy itself writes are rejected here, at startup: a config
+/// that set one of them would silently fight the proxy, or be silently
+/// overwritten, and neither failure is visible in a request log.
+///
+/// An absent or empty table disables the feature (`None`).
+fn build_extra_body(
+    upstream_type: UpstreamType,
+    raw: Option<toml::Value>,
+) -> Result<Option<serde_json::Value>, Error> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err(Error::Config(format!(
+            "[extra_body] must be a table of JSON-compatible values, found {}",
+            toml_type_name(&raw)
+        )));
+    };
+    let object = toml_table_to_json(table, "extra_body")?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+    validate_extra_body(upstream_type, &object)?;
+    Ok(Some(serde_json::Value::Object(object)))
+}
+
+/// Human-readable TOML type name for error messages.
+fn toml_type_name(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "a string",
+        toml::Value::Integer(_) => "an integer",
+        toml::Value::Float(_) => "a float",
+        toml::Value::Boolean(_) => "a boolean",
+        toml::Value::Datetime(_) => "a date/time",
+        toml::Value::Array(_) => "an array",
+        toml::Value::Table(_) => "a table",
+    }
+}
+
+/// Convert a TOML value into its JSON counterpart, naming the offending path
+/// (`[extra_body.providerOptions.gateway]`) in any error.
+///
+/// TOML tables becoming JSON objects is the point of the feature. Dates are the
+/// one type with no exact JSON form — serialising one would emit a
+/// `$__toml_private_datetime` marker object — so they are rejected with an
+/// actionable message instead. Non-finite floats have no JSON representation
+/// either and are caught by the explicit `from_f64` check below.
+fn toml_to_json(value: &toml::Value, path: &str) -> Result<serde_json::Value, Error> {
+    Ok(match value {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(i) => serde_json::Value::from(*i),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "[{path}] is not a finite number; JSON cannot carry NaN or infinity"
+                ))
+            })?,
+        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        toml::Value::Datetime(d) => {
+            return Err(Error::Config(format!(
+                "[{path}] is a TOML date/time ({d}); write it as a string so it has an exact JSON form"
+            )));
+        }
+        toml::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                out.push(toml_to_json(item, &format!("{path}[{index}]"))?);
+            }
+            serde_json::Value::Array(out)
+        }
+        toml::Value::Table(table) => serde_json::Value::Object(toml_table_to_json(table, path)?),
+    })
+}
+
+/// Convert a TOML table into a JSON object, preserving the table's iteration
+/// order so the same profile serialises the same way on every load.
+///
+/// Called both for the top-level `[extra_body]` table (so the caller holds a
+/// `Map`, not an untyped `Value`) and for every nested table.
+fn toml_table_to_json(
+    table: &toml::Table,
+    path: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
+    let mut out = serde_json::Map::new();
+    for (key, item) in table {
+        out.insert(key.clone(), toml_to_json(item, &format!("{path}.{key}"))?);
+    }
+    Ok(out)
+}
+
+/// Request-body keys the proxy itself writes, which `[extra_body]` may never
+/// set. The reason text is user-facing: it says where the value really comes
+/// from, so the fix is obvious.
+const ALWAYS_RESERVED: [(&str, &str); 4] = [
+    ("model", "the profile's model always wins"),
+    (
+        "stream",
+        "the client's stream flag decides which response pipeline runs",
+    ),
+    (
+        "messages",
+        "the conversation is produced by the request conversion",
+    ),
+    (
+        "input",
+        "the conversation is produced by the request conversion",
+    ),
+];
+
+/// Reject `[extra_body]` keys the proxy owns.
+///
+/// The guarded set is upstream-format specific so the table stays useful: a
+/// Chat upstream's vendor `thinking` field is allowed (only the Anthropic
+/// master switch owns that name), and a Responses upstream may set
+/// `reasoning.summary` (only `reasoning.effort` is policy). A partly owned
+/// parent (`stream_options`, `reasoning`) must at least be a table: a scalar
+/// would replace the object at merge time and delete the proxy's sub-key.
+///
+/// Takes the already-converted object, so a non-object table is impossible
+/// here: `build_extra_body` owns that shape check and reports it with the
+/// table's TOML type.
+fn validate_extra_body(
+    upstream_type: UpstreamType,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), Error> {
+    for (key, reason) in ALWAYS_RESERVED {
+        if obj.contains_key(key) {
+            return Err(reserved_key_error(key, reason));
+        }
+    }
+
+    match upstream_type {
+        UpstreamType::AnthropicMessages => {
+            if obj.contains_key("thinking") {
+                return Err(reserved_key_error(
+                    "thinking",
+                    "it is controlled by [reasoning] thinking",
+                ));
+            }
+        }
+        UpstreamType::OaiChat => {
+            if obj.contains_key("reasoning_effort") {
+                return Err(reserved_key_error(
+                    "reasoning_effort",
+                    "it comes only from [reasoning] effort",
+                ));
+            }
+            // `stream_options` is only partly the proxy's: the conversion
+            // paths add `include_usage` for streaming chats. A non-object
+            // value would replace the whole key at merge time and silently
+            // drop that flag, so the shape must be a table.
+            match obj.get("stream_options") {
+                None => {}
+                Some(serde_json::Value::Object(options)) => {
+                    if options.contains_key("include_usage") {
+                        return Err(reserved_key_error(
+                            "stream_options.include_usage",
+                            "the proxy sets it for streaming chat requests",
+                        ));
+                    }
+                }
+                Some(_) => {
+                    return Err(reserved_key_error(
+                        "stream_options",
+                        "must be a table when set, because the proxy writes \
+                         stream_options.include_usage for streaming chat requests",
+                    ));
+                }
+            }
+        }
+        UpstreamType::OaiResponses => {
+            // Same shape rule for `reasoning`: `reasoning.effort` is policy, so
+            // a scalar/array here would erase it when merged.
+            match obj.get("reasoning") {
+                None => {}
+                Some(serde_json::Value::Object(reasoning)) => {
+                    if reasoning.contains_key("effort") {
+                        return Err(reserved_key_error(
+                            "reasoning.effort",
+                            "it comes only from [reasoning] effort",
+                        ));
+                    }
+                }
+                Some(_) => {
+                    return Err(reserved_key_error(
+                        "reasoning",
+                        "must be a table when set, because the proxy writes \
+                         reasoning.effort when the client asks for reasoning",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn reserved_key_error(key: &str, reason: &str) -> Error {
+    Error::Config(format!("Invalid [extra_body] key \"{key}\": {reason}"))
 }
 
 /// Vision is strictly additive: it needs `url` + `api_key` + `model`, all
@@ -425,8 +666,7 @@ fn build_vision_config(raw: RawVision) -> Option<VisionConfig> {
         return None;
     };
 
-    let override_headers =
-        header_overrides_from_pairs("[vision.headers]", raw.headers);
+    let override_headers = header_overrides_from_pairs("[vision.headers]", raw.headers);
 
     // Prompt mode: trim + lowercase; unknown → "auto" with a one-time startup
     // warning. Vision tuning is optional, so a bad value never blocks startup.
@@ -435,9 +675,7 @@ fn build_vision_config(raw: RawVision) -> Option<VisionConfig> {
     let prompt_mode = match prompt_mode.as_str() {
         "auto" | "general" | "ui" | "compact" => prompt_mode,
         other => {
-            tracing::warn!(
-                "[vision] Unknown prompt_mode \"{other}\", falling back to \"auto\""
-            );
+            tracing::warn!("[vision] Unknown prompt_mode \"{other}\", falling back to \"auto\"");
             "auto".to_string()
         }
     };
@@ -470,6 +708,7 @@ mod tests {
         SETTINGS_FILE,
     };
     use crate::forward::{ReasoningEffortOverride, UpstreamType};
+    use serde_json::json;
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
@@ -512,6 +751,7 @@ api_key = "sk-test"
         assert_eq!(cfg.auth_key, None);
         assert!(!cfg.vision_supplement_enabled);
         assert!(cfg.override_headers.is_empty());
+        assert!(cfg.extra_body.is_none());
         assert!(cfg.vision.is_none());
         assert!(cfg.reasoning_policy.thinking_enabled);
         assert_eq!(
@@ -585,7 +825,10 @@ X-V = "1"
 
     fn load_err(dir: &Path, name: &str, content: &str) -> String {
         write_profile(dir, name, content);
-        load_profile(dir, name).err().expect("should fail").to_string()
+        load_profile(dir, name)
+            .err()
+            .expect("should fail")
+            .to_string()
     }
 
     #[test]
@@ -604,14 +847,22 @@ X-V = "1"
     #[test]
     fn wrong_type_is_rejected() {
         let dir = tempdir().unwrap();
-        let err = load_err(dir.path(), "bad", &format!("{MINIMAL_TOML}\nlisten_port = \"x\"\n"));
+        let err = load_err(
+            dir.path(),
+            "bad",
+            &format!("{MINIMAL_TOML}\nlisten_port = \"x\"\n"),
+        );
         assert!(err.contains("listen_port"), "err: {err}");
     }
 
     #[test]
     fn out_of_range_port_is_rejected() {
         let dir = tempdir().unwrap();
-        let err = load_err(dir.path(), "bad", &format!("{MINIMAL_TOML}\nlisten_port = 70000\n"));
+        let err = load_err(
+            dir.path(),
+            "bad",
+            &format!("{MINIMAL_TOML}\nlisten_port = 70000\n"),
+        );
         assert!(err.contains("listen_port"), "err: {err}");
     }
 
@@ -623,7 +874,10 @@ X-V = "1"
             "bad",
             "upstream_type = \"oai-chat\"\nurl = \"https://x\"\n",
         );
-        assert!(err.contains("missing field") && err.contains("api_key"), "err: {err}");
+        assert!(
+            err.contains("missing field") && err.contains("api_key"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -677,7 +931,9 @@ X-V = "1"
 
     #[test]
     fn vision_requires_all_three_non_blank_keys() {
-        assert!(build_vision_config(raw_vision(Some("https://v/x"), Some("k"), Some("m"))).is_some());
+        assert!(
+            build_vision_config(raw_vision(Some("https://v/x"), Some("k"), Some("m"))).is_some()
+        );
         // Missing any one key disables the whole feature…
         for (u, k, m) in [
             (None, Some("k"), Some("m")),
@@ -730,9 +986,8 @@ X-V = "1"
         assert_eq!(build_vision_config(some).unwrap().max_tokens, Some(512));
 
         // Negative values are rejected by serde itself.
-        let negative = toml::from_str::<RawVision>(
-            "url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\nmax_tokens=-1\n",
-        );
+        let negative =
+            toml::from_str::<RawVision>("url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\nmax_tokens=-1\n");
         assert!(negative.is_err());
     }
 
@@ -743,9 +998,7 @@ X-V = "1"
     #[test]
     fn reasoning_table_feeds_shared_parser() {
         let dir = tempdir().unwrap();
-        let toml = format!(
-            "{MINIMAL_TOML}\n[reasoning]\nthinking = false\neffort = \"off\"\n"
-        );
+        let toml = format!("{MINIMAL_TOML}\n[reasoning]\nthinking = false\neffort = \"off\"\n");
         write_profile(dir.path(), "r", &toml);
         let loaded = load_profile(dir.path(), "r").expect("reasoning profile loads");
         let policy = &loaded.config.reasoning_policy;
@@ -761,15 +1014,227 @@ X-V = "1"
         let loaded = load_profile(dir.path(), "r").expect("reasoning profile loads");
         let policy = &loaded.config.reasoning_policy;
         assert!(policy.thinking_enabled);
-        assert_eq!(
-            policy.effort,
-            ReasoningEffortOverride::Set("xhigh".into())
-        );
+        assert_eq!(policy.effort, ReasoningEffortOverride::Set("xhigh".into()));
     }
 
     // -----------------------------------------------------------------------
-    // Paths & names
+    // [extra_body]
     // -----------------------------------------------------------------------
+
+    /// A profile whose only table is `[extra_body]`, holding `extra`.
+    fn profile_with_extra_body(upstream_type: &str, extra: &str) -> String {
+        format!(
+            "upstream_type = \"{upstream_type}\"\nurl = \"https://x\"\napi_key = \"k\"\n\n[extra_body]\n{extra}\n"
+        )
+    }
+
+    fn extra_body_of(upstream_type: &str, extra: &str) -> serde_json::Value {
+        let dir = tempdir().unwrap();
+        write_profile(
+            dir.path(),
+            "e",
+            &profile_with_extra_body(upstream_type, extra),
+        );
+        load_profile(dir.path(), "e")
+            .expect("profile loads")
+            .config
+            .extra_body
+            .expect("extra_body present")
+    }
+
+    fn extra_body_err(upstream_type: &str, extra: &str) -> String {
+        let dir = tempdir().unwrap();
+        load_err(
+            dir.path(),
+            "e",
+            &profile_with_extra_body(upstream_type, extra),
+        )
+    }
+
+    #[test]
+    fn extra_body_maps_toml_values_to_json() {
+        let extra = extra_body_of(
+            "oai-chat",
+            "providerOptions = { gateway = { only = [\"deepseek\"], retries = 2 } }\n\
+             temperature = 0.3\nflag = true\nnote = \"x\"\n",
+        );
+        assert_eq!(
+            extra["providerOptions"]["gateway"]["only"],
+            json!(["deepseek"])
+        );
+        assert_eq!(extra["providerOptions"]["gateway"]["retries"], json!(2));
+        assert_eq!(extra["temperature"], json!(0.3));
+        assert_eq!(extra["flag"], json!(true));
+        assert_eq!(extra["note"], json!("x"));
+        // TOML dotted headers build the same nested object as inline tables.
+        let dotted = extra_body_of(
+            "oai-chat",
+            "[extra_body.providerOptions.gateway]\nonly = [\"deepseek\"]\n",
+        );
+        assert_eq!(
+            dotted["providerOptions"]["gateway"]["only"],
+            json!(["deepseek"])
+        );
+    }
+
+    #[test]
+    fn empty_extra_body_table_disables_the_feature() {
+        let dir = tempdir().unwrap();
+        write_profile(dir.path(), "e", &profile_with_extra_body("oai-chat", ""));
+        let cfg = load_profile(dir.path(), "e").expect("loads").config;
+        assert!(cfg.extra_body.is_none());
+    }
+
+    #[test]
+    fn non_table_extra_body_is_rejected() {
+        // `extra_body = "..."` is a scalar, not the table the feature needs —
+        // a top-level shape error, distinct from the key checks below.
+        let dir = tempdir().unwrap();
+        let msg = load_err(
+            dir.path(),
+            "e",
+            &format!("{MINIMAL_TOML}\nextra_body = \"not a table\"\n"),
+        );
+        assert!(msg.contains("[extra_body] must be a table"), "msg: {msg}");
+    }
+
+    #[test]
+    fn extra_body_build_errors_name_the_profile_file() {
+        let dir = tempdir().unwrap();
+        let msg = load_err(
+            dir.path(),
+            "e",
+            &profile_with_extra_body("oai-chat", "model = \"m\""),
+        );
+        assert!(
+            msg.contains(profile_path(dir.path(), "e").to_str().unwrap()),
+            "msg: {msg}"
+        );
+        // The error class is prefixed exactly once, not once per wrap.
+        assert_eq!(msg.matches("configuration error:").count(), 1, "msg: {msg}");
+    }
+
+    #[test]
+    fn extra_body_rejects_keys_the_proxy_owns() {
+        // (upstream_type, TOML line, substring the error must name)
+        let cases = [
+            ("oai-chat", "model = \"m\"", "model"),
+            ("oai-chat", "stream = true", "stream"),
+            ("oai-chat", "messages = []", "messages"),
+            ("oai-responses", "input = []", "input"),
+            (
+                "anthropic-messages",
+                "thinking = { type = \"enabled\" }",
+                "thinking",
+            ),
+            ("oai-chat", "reasoning_effort = \"low\"", "reasoning_effort"),
+            (
+                "oai-responses",
+                "reasoning = { effort = \"low\" }",
+                "reasoning.effort",
+            ),
+            (
+                "oai-chat",
+                "stream_options = { include_usage = false }",
+                "stream_options.include_usage",
+            ),
+        ];
+        for (upstream, line, expected) in cases {
+            let msg = extra_body_err(upstream, line);
+            assert!(
+                msg.starts_with("configuration error:"),
+                "upstream={upstream} line={line} msg: {msg}"
+            );
+            assert!(
+                msg.contains("Invalid [extra_body] key") && msg.contains(expected),
+                "upstream={upstream} line={line} msg: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_body_keeps_format_specific_near_misses_usable() {
+        // A Responses upstream may set reasoning.summary; only effort is policy.
+        let extra = extra_body_of("oai-responses", "reasoning = { summary = \"auto\" }");
+        assert_eq!(extra["reasoning"]["summary"], json!("auto"));
+
+        // A Chat upstream's vendor-specific `thinking` is not the Anthropic
+        // master switch, so it stays configurable.
+        let extra = extra_body_of("oai-chat", "thinking = { type = \"enabled\" }");
+        assert_eq!(extra["thinking"]["type"], json!("enabled"));
+
+        // Only include_usage is reserved inside stream_options.
+        let extra = extra_body_of("oai-chat", "stream_options = { foo = 1 }");
+        assert_eq!(extra["stream_options"]["foo"], json!(1));
+
+        // Anthropic upstreams have no effort concept — top_k and friends pass.
+        let extra = extra_body_of("anthropic-messages", "top_k = 20");
+        assert_eq!(extra["top_k"], json!(20));
+    }
+
+    #[test]
+    fn extra_body_rejects_toml_datetime_with_its_path() {
+        let msg = extra_body_err("oai-chat", "when = 2024-01-02T03:04:05Z");
+        assert!(msg.contains("[extra_body.when]"), "msg: {msg}");
+        assert!(msg.contains("date/time"), "msg: {msg}");
+
+        // Nested paths are named down to the offending value.
+        let msg = extra_body_err("oai-chat", "vendor = { when = 2024-01-02 }");
+        assert!(msg.contains("[extra_body.vendor.when]"), "msg: {msg}");
+
+        let msg = extra_body_err("oai-chat", "list = [1979-05-27T07:32:00Z]");
+        assert!(msg.contains("[extra_body.list[0]]"), "msg: {msg}");
+    }
+
+    /// A partly owned parent must be a table: a scalar/array would replace the
+    /// whole value at merge time and erase the proxy's own sub-key.
+    #[test]
+    fn extra_body_rejects_non_table_reserved_parents() {
+        let cases = [
+            ("oai-responses", "reasoning = \"high\"", "\"reasoning\""),
+            ("oai-responses", "reasoning = [\"effort\"]", "\"reasoning\""),
+            ("oai-chat", "stream_options = \"off\"", "\"stream_options\""),
+            ("oai-chat", "stream_options = [1]", "\"stream_options\""),
+        ];
+        for (upstream, line, expected) in cases {
+            let msg = extra_body_err(upstream, line);
+            assert!(
+                msg.contains("Invalid [extra_body] key") && msg.contains(expected),
+                "upstream={upstream} line={line} msg: {msg}"
+            );
+        }
+    }
+
+    /// The same profile always serialises to the same bytes, and those bytes are
+    /// pinned. `toml` 0.8 keeps tables in a `BTreeMap` (no `preserve_order`
+    /// feature), so `[extra_body]` keys come out in ascending order;
+    /// `serde_json`'s `preserve_order` then keeps the insertion order it was
+    /// given. Comparing two loads with each other would pass for any
+    /// deterministic implementation, so the expected string is spelled out: a
+    /// change to either ordering changes what goes on the wire and must be an
+    /// explicit update here, never silent drift.
+    #[test]
+    fn extra_body_serialisation_is_stable_across_loads() {
+        let dir = tempdir().unwrap();
+        write_profile(
+            dir.path(),
+            "e",
+            &profile_with_extra_body("oai-chat", "zeta = 1\nalpha = { beta = [true, \"x\"] }\n"),
+        );
+        let load = || {
+            load_profile(dir.path(), "e")
+                .expect("profile loads")
+                .config
+                .extra_body
+                .expect("extra_body present")
+        };
+        let first = load();
+        let second = load();
+        let first_bytes = serde_json::to_string(&first).unwrap();
+        assert_eq!(first_bytes, serde_json::to_string(&second).unwrap());
+        assert_eq!(first_bytes, r#"{"alpha":{"beta":[true,"x"]},"zeta":1}"#);
+        assert_eq!(first["alpha"]["beta"], json!([true, "x"]));
+    }
 
     #[test]
     fn profile_name_validation_matrix() {
@@ -777,7 +1242,16 @@ X-V = "1"
             assert!(validate_profile_name(ok).is_ok(), "{ok:?}");
         }
         for bad in [
-            "", ".", "..", "a/b", "a\\b", "has space", "../escape", "中文", "a\tb", ".hidden",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "has space",
+            "../escape",
+            "中文",
+            "a\tb",
+            ".hidden",
         ] {
             assert!(validate_profile_name(bad).is_err(), "{bad:?}");
         }
@@ -846,7 +1320,9 @@ X-V = "1"
     #[test]
     fn missing_profile_reports_path_list_hint_and_writes_template() {
         let dir = tempdir().unwrap();
-        let err = load_profile(dir.path(), "nosuch").err().expect("should fail");
+        let err = load_profile(dir.path(), "nosuch")
+            .err()
+            .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("nosuch.toml"), "msg: {msg}");
         assert!(msg.contains("--list"), "msg: {msg}");
@@ -874,7 +1350,9 @@ X-V = "1"
         let template = profile_path(dir.path(), DEFAULT_PROFILE);
         fs::write(&template, "upstream_type = \"sentinel\"\n").unwrap();
 
-        let err = load_profile(dir.path(), "other").err().expect("should fail");
+        let err = load_profile(dir.path(), "other")
+            .err()
+            .expect("should fail");
         assert!(
             !err.to_string().contains("starter template"),
             "existing template must not be reported as written: {err}"
@@ -975,11 +1453,7 @@ X-V = "1"
         let dir = tempdir().unwrap();
         write_profile(dir.path(), "default", "");
         write_profile(dir.path(), "a", "");
-        fs::write(
-            dir.path().join(SETTINGS_FILE),
-            "current_profile = \"a\"\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join(SETTINGS_FILE), "current_profile = \"a\"\n").unwrap();
         fs::write(dir.path().join(".hidden.toml"), "").unwrap();
         assert_eq!(list_profiles(dir.path()), vec!["a", "default"]);
     }

@@ -68,8 +68,10 @@ impl ToolLogState {
             existing.push_args(args);
             return;
         }
-        self.open
-            .insert(key.to_string(), ToolCall::open(name, &format!("{buffered}{args}")));
+        self.open.insert(
+            key.to_string(),
+            ToolCall::open(name, &format!("{buffered}{args}")),
+        );
         self.order.push(key.to_string());
     }
 
@@ -79,7 +81,10 @@ impl ToolLogState {
         if let Some(tool) = self.open.get_mut(key) {
             tool.push_args(delta);
         } else {
-            self.pending.entry(key.to_string()).or_default().push_str(delta);
+            self.pending
+                .entry(key.to_string())
+                .or_default()
+                .push_str(delta);
         }
     }
 
@@ -146,29 +151,29 @@ fn extract_log_fragment(
                 }
                 Vec::new()
             }
-            Some("content_block_delta") => match value.pointer("/delta/type").and_then(Value::as_str)
-            {
-                Some("text_delta") => value
-                    .pointer("/delta/text")
-                    .and_then(Value::as_str)
-                    .map(|text| vec![text.to_string()])
-                    .unwrap_or_default(),
-                Some("thinking_delta") => value
-                    .pointer("/delta/thinking")
-                    .and_then(Value::as_str)
-                    .map(|text| vec![text.to_string()])
-                    .unwrap_or_default(),
-                Some("input_json_delta") => {
-                    if let Some(partial) = value
-                        .pointer("/delta/partial_json")
+            Some("content_block_delta") => {
+                match value.pointer("/delta/type").and_then(Value::as_str) {
+                    Some("text_delta") => value
+                        .pointer("/delta/text")
                         .and_then(Value::as_str)
-                    {
-                        tools.push_args(&anthropic_key(value), partial);
+                        .map(|text| vec![text.to_string()])
+                        .unwrap_or_default(),
+                    Some("thinking_delta") => value
+                        .pointer("/delta/thinking")
+                        .and_then(Value::as_str)
+                        .map(|text| vec![text.to_string()])
+                        .unwrap_or_default(),
+                    Some("input_json_delta") => {
+                        if let Some(partial) =
+                            value.pointer("/delta/partial_json").and_then(Value::as_str)
+                        {
+                            tools.push_args(&anthropic_key(value), partial);
+                        }
+                        Vec::new()
                     }
-                    Vec::new()
+                    _ => Vec::new(),
                 }
-                _ => Vec::new(),
-            },
+            }
             Some("content_block_stop") => tools.close(&anthropic_key(value)).into_iter().collect(),
             _ => Vec::new(),
         },
@@ -388,7 +393,10 @@ mod tests {
     fn extract_anthropic_text_delta() {
         let ev = json!({"type":"content_block_delta","index":0,
                         "delta":{"type":"text_delta","text":"hello"}});
-        assert_eq!(run(StreamFormat::Anthropic, &[ev]), vec!["hello".to_string()]);
+        assert_eq!(
+            run(StreamFormat::Anthropic, &[ev]),
+            vec!["hello".to_string()]
+        );
     }
 
     #[test]
@@ -428,20 +436,32 @@ mod tests {
 
         let null_first = json!({"id":"1","choices":[{"delta":{
             "reasoning_content":null,"reasoning":"think"}}]});
-        assert_eq!(run(StreamFormat::Chat, &[null_first]), vec!["think".to_string()]);
+        assert_eq!(
+            run(StreamFormat::Chat, &[null_first]),
+            vec!["think".to_string()]
+        );
 
         let empty_first = json!({"id":"1","choices":[{"delta":{
             "reasoning_content":"","reasoning":"think"}}]});
-        assert_eq!(run(StreamFormat::Chat, &[empty_first]), vec!["think".to_string()]);
+        assert_eq!(
+            run(StreamFormat::Chat, &[empty_first]),
+            vec!["think".to_string()]
+        );
     }
 
     #[test]
     fn extract_responses_text_and_reasoning() {
         let ev = json!({"type":"response.output_text.delta","delta":"world"});
-        assert_eq!(run(StreamFormat::Responses, &[ev]), vec!["world".to_string()]);
+        assert_eq!(
+            run(StreamFormat::Responses, &[ev]),
+            vec!["world".to_string()]
+        );
 
         let ev = json!({"type":"response.reasoning_summary_text.delta","delta":"notes"});
-        assert_eq!(run(StreamFormat::Responses, &[ev]), vec!["notes".to_string()]);
+        assert_eq!(
+            run(StreamFormat::Responses, &[ev]),
+            vec!["notes".to_string()]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -780,7 +800,10 @@ mod tests {
         let error = logged.find("[ERR-RESP");
         assert!(marker.is_some(), "log was: {logged}");
         assert!(error.is_some(), "log was: {logged}");
-        assert!(marker < error, "marker must precede the error line: {logged}");
+        assert!(
+            marker < error,
+            "marker must precede the error line: {logged}"
+        );
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ _Verified by_: `manual-test` scripts run against a same-format upstream; the pas
 **FR-5 — Every upstream format is declared, never inferred.** The main upstream declares `upstream_type` in its profile; the `[vision]` endpoint declares `[vision].upstream_type`. Valid values are `anthropic-messages`, `oai-chat`, `oai-responses`. No URL is inspected to decide a format (ADR-0002, ADR-0004).
 _Verified by_: inline tests in `config`; a URL that contains no format marker still resolves correctly.
 
-**FR-6 — Configuration is TOML profiles.** A profile lives at `~/.ai-bridge/<name>.toml`, selects one upstream by name, and holds `upstream_type` / `url` / `api_key` plus optional `[headers]` / `[reasoning]` / `[vision]` / `[chat]` tables. Unknown keys fail startup rather than silently doing nothing. No configuration *value* comes from the environment; `RUST_LOG` is the one exception, because it is the `tracing` convention (ADR-0005). The config directory is not configured either: it is the platform home directory (`std::env::home_dir`) joined with `.ai-bridge`, and on Windows that lookup never consults `HOME` (ADR-0005).
+**FR-6 — Configuration is TOML profiles.** A profile lives at `~/.ai-bridge/<name>.toml`, selects one upstream by name, and holds `upstream_type` / `url` / `api_key` plus optional `[headers]` / `[reasoning]` / `[extra_body]` / `[vision]` / `[chat]` tables. Unknown keys fail startup rather than silently doing nothing. No configuration *value* comes from the environment; `RUST_LOG` is the one exception, because it is the `tracing` convention (ADR-0005). The config directory is not configured either: it is the platform home directory (`std::env::home_dir`) joined with `.ai-bridge`, and on Windows that lookup never consults `HOME` (ADR-0005).
 _Verified by_: inline tests in `config` for unknown-key rejection and for the config-directory resolution (`config_dir` rejects a missing or blank home and keeps a non-blank one verbatim, `home_config_dir` joins the platform home); the Windows leg of the `test` CI job runs those tests on Windows. That `HOME` is never consulted there is `std::env::home_dir`'s own guarantee (fixed in Rust 1.85), which `rust-version` pins.
 
 **FR-7 — The profile's token-cap field name is explicit.** `[chat] max_tokens_field` says which spelling the upstream wants (`max_tokens`, the default, or `max_completion_tokens`). The proxy never picks a field name by reading the model name (ADR-0011).
@@ -31,6 +31,9 @@ _Verified by_: inline tests in `convert`.
 
 **FR-8 — Outbound reasoning effort is a single configured value.** `reasoning_effort` / `reasoning.effort` comes only from `[reasoning] effort` (default `max`), stamped on every outbound request, including pass-through. Conversions decide only *whether* reasoning was requested; a thinking-disabled request must not gain an effort field (ADR-0011).
 _Verified by_: inline tests in `convert` and `forward`.
+
+**FR-23 — Custom outbound body fields come from the profile and never override proxy-owned keys.** Optional `[extra_body]` fields are merged into every outgoing request body for the main upstream — all entry × upstream paths, pass-through included — with the configured value winning on conflict. Keys the proxy itself writes (`model`, `stream`, the conversation container, the format's reasoning field, and the streaming usage flag) are rejected at startup, never silently ignored. A `[extra_body]` value with no exact JSON form (a TOML date/time) is likewise a startup error. The table never reaches `[vision]` requests (ADR-0014).
+_Verified by_: inline tests in `config` (TOML→JSON mapping, reserved-key matrix, date rejection) and `forward` (deep-merge semantics, determinism).
 
 ## 3. Conversion
 

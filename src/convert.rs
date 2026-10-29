@@ -378,10 +378,7 @@ fn convert_message_to_openai(
                             .get("media_type")
                             .and_then(|m| m.as_str())
                             .unwrap_or("image/png");
-                        let data = source
-                            .get("data")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
+                        let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
                         content_parts.push(json!({
                             "type": "image_url",
                             "image_url": {
@@ -409,8 +406,7 @@ fn convert_message_to_openai(
                         .and_then(|i| i.as_str())
                         .unwrap_or("");
                     let content_val = block.get("content");
-                    let media_plan =
-                        content_val.cloned().and_then(plan_chat_tool_output_media);
+                    let media_plan = content_val.cloned().and_then(plan_chat_tool_output_media);
                     let content_str = if let Some(plan) = media_plan {
                         queue_chat_tool_output_media(
                             &mut pending_tool_media,
@@ -466,9 +462,8 @@ fn convert_message_to_openai(
                             let text = crate::reasoning_bridge::reasoning_summary_text(&item);
                             (!text.is_empty()).then_some(text)
                         });
-                    reasoning_parts.push(
-                        recovered.unwrap_or_else(|| "[redacted thinking]".to_string()),
-                    );
+                    reasoning_parts
+                        .push(recovered.unwrap_or_else(|| "[redacted thinking]".to_string()));
                 }
                 _ => {}
             }
@@ -1708,8 +1703,7 @@ pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new
                 let valid_up_to = e.valid_up_to();
                 if valid_up_to > 0 {
                     buffer.push_str(
-                        std::str::from_utf8(&input[pos..pos + valid_up_to])
-                            .unwrap_or(""),
+                        std::str::from_utf8(&input[pos..pos + valid_up_to]).unwrap_or(""),
                     );
                     pos += valid_up_to;
                 }
@@ -1751,7 +1745,9 @@ mod tests {
     /// block (`data: {...}\n\n`) since `take_sse_block` frames on `\n\n`.
     async fn run(frames: Vec<&'static str>) -> Vec<(String, Value)> {
         let upstream = futures::stream::iter(
-            frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
         );
         let out = chat_to_anthropic_sse(upstream, "claude-sonnet-5".to_string(), ReqLog::new());
         let chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
@@ -1785,7 +1781,9 @@ mod tests {
     /// only cover the forwarded bytes).
     async fn run_logged(frames: Vec<&'static str>) -> String {
         let upstream = futures::stream::iter(
-            frames.into_iter().map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
         );
         let (reqlog, captured) = ReqLog::captured();
         let out = chat_to_anthropic_sse(upstream, "claude-sonnet-5".to_string(), reqlog);
@@ -1820,10 +1818,7 @@ mod tests {
         ])
         .await;
         assert!(logged.contains("Let me look."), "log was: {logged}");
-        assert!(
-            logged.contains("[tool_use: bash] {}"),
-            "log was: {logged}"
-        );
+        assert!(logged.contains("[tool_use: bash] {}"), "log was: {logged}");
     }
 
     #[test]
@@ -1864,10 +1859,7 @@ mod tests {
         ])
         .await;
 
-        let delta = events
-            .iter()
-            .find(|(e, _)| e == "message_delta")
-            .unwrap();
+        let delta = events.iter().find(|(e, _)| e == "message_delta").unwrap();
         assert_eq!(delta.1["delta"]["stop_reason"], "refusal");
     }
 
@@ -1931,7 +1923,10 @@ mod tests {
         // signature_delta must exist (as content_block_delta), the thinking
         // block's stop must precede message_stop.
         assert!(names.contains(&"content_block_delta"));
-        let stop_pos = names.iter().position(|&n| n == "content_block_stop").unwrap();
+        let stop_pos = names
+            .iter()
+            .position(|&n| n == "content_block_stop")
+            .unwrap();
         let msg_stop_pos = names.iter().position(|&n| n == "message_stop").unwrap();
         assert!(stop_pos < msg_stop_pos);
     }
@@ -1948,7 +1943,9 @@ mod tests {
 
         let sig_pos = events
             .iter()
-            .position(|(e, d)| e == "content_block_delta" && d["delta"]["type"] == "signature_delta")
+            .position(|(e, d)| {
+                e == "content_block_delta" && d["delta"]["type"] == "signature_delta"
+            })
             .unwrap();
         let stop_pos = events
             .iter()
@@ -1956,14 +1953,18 @@ mod tests {
             .unwrap();
         let tool_start_pos = events
             .iter()
-            .position(|(e, d)| e == "content_block_start" && d["content_block"]["type"] == "tool_use")
+            .position(|(e, d)| {
+                e == "content_block_start" && d["content_block"]["type"] == "tool_use"
+            })
             .unwrap();
         assert!(sig_pos < stop_pos && stop_pos < tool_start_pos);
         // Signature emitted exactly once.
         assert_eq!(
             events
                 .iter()
-                .filter(|(e, d)| e == "content_block_delta" && d["delta"]["type"] == "signature_delta")
+                .filter(
+                    |(e, d)| e == "content_block_delta" && d["delta"]["type"] == "signature_delta"
+                )
                 .count(),
             1
         );
@@ -2015,7 +2016,10 @@ mod tests {
         let error = logged.find("[ERR-RESP");
         assert!(marker.is_some(), "log was: {logged}");
         assert!(error.is_some(), "log was: {logged}");
-        assert!(marker < error, "marker must precede the error line: {logged}");
+        assert!(
+            marker < error,
+            "marker must precede the error line: {logged}"
+        );
     }
 
     #[tokio::test]

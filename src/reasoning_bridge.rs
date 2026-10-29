@@ -191,7 +191,10 @@ mod tests {
 
     #[test]
     fn test_rejects_non_reasoning_blocks() {
-        assert!(openai_reasoning_item_from_anthropic_block(&json!({"type": "text", "text": "hi"})).is_none());
+        assert!(
+            openai_reasoning_item_from_anthropic_block(&json!({"type": "text", "text": "hi"}))
+                .is_none()
+        );
     }
 
     #[test]

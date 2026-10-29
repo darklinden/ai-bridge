@@ -91,6 +91,9 @@ thinking = true                # master switch, default true
 effort   = "max"               # default max; off/drop/none/disable/disabled removes the field;
                                # any other value passes through lowercased verbatim (e.g. xhigh)
 
+[extra_body]                   # extra JSON fields merged into every outgoing request body
+providerOptions = { gateway = { only = ["deepseek"] } }  # e.g. pin a gateway's provider list
+
 [vision]                       # optional vision model for image description (all three keys required)
 url      = "https://vl.example.com/v1/chat/completions"  # format inferred: /responses, /messages, else chat
 api_key  = "sk-your-vision-key"
@@ -105,6 +108,7 @@ Key semantics:
 
 - `model` — every request body has its `model` replaced by this value; a client-supplied model never reaches the upstream.
 - `[reasoning] effort` — the single source of truth for the outgoing effort value; only stamped when the client actually asked for reasoning. No per-model mapping exists.
+- `[extra_body]` — vendor-specific JSON fields merged (recursively) into every outgoing request body for the main upstream; the configured value wins on conflict, and new keys are appended in a fixed key order so the same profile always serialises identically. It applies to all three entries and to pass-through (which is *unconverted*, not *unmodified*), but never to `[vision]` calls. Keys the proxy owns are rejected at startup rather than silently ignored: `model`, `stream`, `messages`, `input`, plus `thinking` (anthropic-messages), `reasoning_effort` (oai-chat), `reasoning.effort` (oai-responses) and `stream_options.include_usage` (oai-chat). TOML date/time values are rejected because they have no exact JSON form. (ADR-0014)
 - `[vision]` — enabled only when `url`, `api_key`, and `model` are all present and non-blank; otherwise vision logs which keys are missing and disables itself. The endpoint's format is inferred from its path today; making it an explicit declaration is a pending change (see the deviations list linked above).
 - Configuration comes only from the profile file, and no configuration *value* is read from the environment; `RUST_LOG` (a `tracing` filter, default `info`) is the one exception. The directory holding `~/.ai-bridge` is not configuration either: it is the platform home directory — `HOME` on POSIX, `USERPROFILE` on Windows, where `HOME` is deliberately ignored (ADR-0005).
 
