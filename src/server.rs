@@ -333,15 +333,27 @@ fn responses_resp_text(body: &Value) -> String {
     }
 }
 
+/// Inbound request-body cap (the 200 MiB the README promises).
+///
+/// Two independent mechanisms have to agree: `RequestBodyLimitLayer` bounds the
+/// raw body, while `Json` / `Bytes` extractors bound what they buffer through
+/// axum's own `DefaultBodyLimit` (2 MiB unless overridden) and the tower layer
+/// does not set that extension. Configuring only the tower layer therefore
+/// leaves a hidden 2 MiB cap that wins, rejecting sessions far below the
+/// documented limit — the rule is INV-15, and making the cap a profile key
+/// instead of a constant is OPEN-2.
+const MAX_REQUEST_BODY_BYTES: usize = 200 * 1024 * 1024; // 200 MiB
+
 pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/messages", post(handle_messages))
         .route("/v1/chat/completions", post(handle_chat_completions_local))
         .route("/v1/responses", post(handle_responses_local))
         .layer(CorsLayer::permissive())
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            200 * 1024 * 1024,
-        )) // 200 MB
+            MAX_REQUEST_BODY_BYTES,
+        ))
         .with_state(state)
 }
 
@@ -1396,7 +1408,9 @@ fn request_text(body: &Value) -> String {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use axum::http::Request;
     use serde_json::{json, Value};
+    use tower::ServiceExt;
 
     fn header(map: &mut HeaderMap, name: &'static str, value: &'static str) {
         map.insert(name, HeaderValue::from_static(value));
@@ -2275,5 +2289,59 @@ mod tests {
             "text/event-stream"
         );
         assert_eq!(resp.headers().get("Cache-Control").unwrap(), "no-cache");
+    }
+
+    // -----------------------------------------------------------------------
+    // Inbound body limit
+    // -----------------------------------------------------------------------
+
+    /// A `Config` with no auth and no vision: the body limit is enforced by the
+    /// router before any handler logic, so nothing else here is exercised.
+    fn body_limit_test_config() -> crate::forward::Config {
+        crate::forward::Config {
+            upstream_type: UpstreamType::OaiChat,
+            url: "https://up.example/v1/chat/completions".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            listen_addr: "127.0.0.1".into(),
+            listen_port: 18650,
+            auth_key: None,
+            override_headers: HeaderMap::new(),
+            extra_body: None,
+            vision: None,
+            vision_supplement_enabled: false,
+            reasoning_policy: crate::forward::UpstreamReasoningPolicy::parse(None, None),
+        }
+    }
+
+    /// Guards INV-15: raising only the tower `RequestBodyLimitLayer` leaves
+    /// axum's own 2 MiB extractor default in place, so a body just over that
+    /// default must reach the handler instead of being rejected.
+    #[tokio::test]
+    async fn body_just_over_two_mib_clears_the_documented_body_limit() {
+        const OLD_HIDDEN_CAP_PLUS_ONE: usize = 2 * 1024 * 1024 + 1;
+        let app = build_router(Arc::new(AppState::new(body_limit_test_config()).unwrap()));
+        // Deliberately not valid JSON: once the body clears the limit the request
+        // stops at the parse error, so nothing here can reach an upstream.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b'x'; OLD_HIDDEN_CAP_PLUS_ONE]))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a {OLD_HIDDEN_CAP_PLUS_ONE}-byte body must clear the inbound limit"
+        );
+        let text =
+            String::from_utf8_lossy(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .into_owned();
+        assert!(
+            text.contains("Failed to parse the request body as JSON"),
+            "{text}"
+        );
+        assert!(!text.contains("length limit exceeded"), "{text}");
     }
 }

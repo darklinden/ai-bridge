@@ -18,6 +18,9 @@ _Verified by_: inline tests in `server`.
 **FR-4 — Same-format requests skip format conversion.** When the entry's format and the upstream's format are the same, no conversion runs in either direction: the response is re-emitted byte for byte, and the request body is sent without translation. The shared per-request plumbing still applies — inbound auth, the `model` override (FR-3) and the reasoning policy (FR-8) — so "verbatim" here means *unconverted*, not *unmodified*.
 _Verified by_: `manual-test` scripts run against a same-format upstream; the passthrough wrapper re-yields the original chunks.
 
+**FR-24 — The inbound body cap is one documented number.** All three local entries accept a request body up to 200 MiB, and that same value feeds both the tower body limiter and axum's own extractor limit, so a body the cap allows is never rejected by a smaller default further in; a body over the cap is rejected before any handler runs (INV-15). The cap is a constant today; making it a profile key is tracked as OPEN-2.
+_Verified by_: the router-level inline test in `server`, which sends a body just over axum's default extractor limit; the 200 MiB bound itself is not exercised by a test today.
+
 ## 2. Upstream declaration and configuration
 
 **FR-5 — Every upstream format is declared, never inferred.** The main upstream declares `upstream_type` in its profile; the `[vision]` endpoint declares `[vision].upstream_type`. Valid values are `anthropic-messages`, `oai-chat`, `oai-responses`. No URL is inspected to decide a format (ADR-0002, ADR-0004).

@@ -92,6 +92,7 @@ Each invariant states what must hold, how it gets broken, and what currently gua
 | INV-12 | The log observes, it never alters what is forwarded | logging by rewriting a stream instead of teeing it | `passthrough_log` re-yields original chunks (FR-20) |
 | INV-13 | Conversion changes ship with tests | landing a conversion with manual testing only | inline `#[cfg(test)]` convention (FR-9, FR-10) |
 | INV-14 | Profile-supplied outbound fields (`[extra_body]`) are merged at the single outbound seam and never override proxy-owned keys | merging in each handler, or letting a profile set `model`/`stream`/reasoning fields | one merge site in `build_upstream_request`; `config::validate_extra_body` rejects reserved keys at startup (ADR-0014) |
+| INV-15 | The inbound body cap is one number, enforced by both the tower limiter and axum's extractor limit | configuring only `RequestBodyLimitLayer`: the `Json` extractors then buffer through axum's own `DefaultBodyLimit` and reject at its much smaller default before the tower layer is reached | one constant (`MAX_REQUEST_BODY_BYTES`) feeding both layers in `build_router`, and a router-level test just over the old default |
 
 ## 8. Known deviations and open items
 
@@ -118,3 +119,4 @@ Deviations of the code from the requirements above, and questions still open. ID
 | ID | Question | Why it is open |
 |---|---|---|
 | OPEN-1 | Should the `[REQ SYSTEM]` de-duplication be global or per-profile? | it currently suppresses a repeated system prompt across *all* requests, so two clients with different prompts can hide each other's line |
+| OPEN-2 | Should the inbound body cap become a profile key (e.g. `max_body_bytes`) instead of a constant? | it is the hardcoded 200 MiB the README promises (INV-15, FR-24); the incident report behind that fix (DSM-413 §9.3) suggests making it tunable to the upstream's capability, but no requirement asks for it |

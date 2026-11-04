@@ -10,7 +10,7 @@ What you get:
 - **Conversion in both directions**, streaming included, with cross-format paths (e.g. Chat entry → Responses upstream) bridged through Anthropic.
 - **TOML profiles** — keep several upstreams side by side and switch by name; nothing is configured through the environment.
 - **Optional image description** — a text-only upstream can be shown images described by a separately configured vision model.
-- **Inbound token auth** for local clients, permissive CORS, and a 200 MB request-body limit.
+- **Inbound token auth** for local clients, permissive CORS, and a 200 MiB request-body limit.
 
 This file describes the program as it ships today. Where it disagrees with [`docs/requirements.md`](docs/requirements.md), the requirement is the target and the difference is tracked as a known deviation in [`docs/implementation.md`](docs/implementation.md) § 8.
 
