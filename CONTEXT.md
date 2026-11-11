@@ -33,3 +33,7 @@ _Avoid_: image-to-text, vision, image placeholder
 **Upstream type detection**:
 由 profile 的 `upstream_type` 键（主上游）与 `[vision].upstream_type` 键（视觉端点）**显式声明**，决定认证头、格式转换与错误格式。不做 URL 启发式猜测，没有例外（ADR-0002）。
 _Avoid_: auto-detect, url-based detection
+
+**Session header**:
+某些上游要求每个请求带一个稳定的"会话 ID"以做路由与 prompt cache 复用；OpenCode Go 是其中之一，缺失时在鉴权之前就返回 `400 MissingSessionID`。头名由 profile 的 `session_header` 键**显式声明**，未声明则一律不发；值优先取本地客户端自己带来（同名头）的值，否则由本地请求（转换前）的会话开头——system prompt + 首条 user 消息——规范化后哈希派生，故同一对话后续轮次保持不变，代理不保存任何状态。`[vision]` 请求永不携带；同名 `[headers]` 覆盖仍然优先；日志格式不变（ADR-0015）。
+_Avoid_: session, conversation table, sticky routing

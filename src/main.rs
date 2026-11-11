@@ -10,6 +10,7 @@ mod reasoning_bridge;
 mod reqlog;
 mod responses_reverse;
 mod server;
+mod session_id;
 mod streaming_responses;
 mod tool_media;
 mod transform_responses;

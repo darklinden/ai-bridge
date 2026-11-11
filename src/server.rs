@@ -651,6 +651,13 @@ async fn handle_messages(
             .unwrap_or("unknown")
             .to_string();
 
+        // Always override the outgoing model with the configured upstream model.
+        body["model"] = json!(state.config.model.clone());
+        // Built here, before media preprocessing: the session id derives from
+        // the conversation as the client sent it (ADR-0015), and this
+        // constructor is the one place it is attached.
+        let upstream = UpstreamTarget::for_request(&state.config, &headers, ANTHROPIC_ENTRY, &body);
+
         let media_handled = preprocess_media(&mut body, ANTHROPIC_ENTRY, &state).await?;
         let reqlog = setup_reqlog(&body, ANTHROPIC_ENTRY, &model);
         if media_handled > 0 {
@@ -659,11 +666,6 @@ async fn handle_messages(
                 crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
             ));
         }
-
-        // Always override the outgoing model with the configured upstream model.
-        body["model"] = json!(state.config.model.clone());
-
-        let upstream = UpstreamTarget::from(&state.config);
 
         match state.config.upstream_type {
             UpstreamType::OaiChat => {
@@ -717,6 +719,11 @@ async fn handle_chat_completions_local(
             .unwrap_or("unknown")
             .to_string();
 
+        body["model"] = json!(state.config.model.clone());
+        // Built here, before media preprocessing: the session id derives from
+        // the conversation as the client sent it (ADR-0015).
+        let upstream = UpstreamTarget::for_request(&state.config, &headers, CHAT_ENTRY, &body);
+
         let media_handled = preprocess_media(&mut body, CHAT_ENTRY, &state).await?;
         let reqlog = setup_reqlog(&body, CHAT_ENTRY, &model);
         if media_handled > 0 {
@@ -725,10 +732,6 @@ async fn handle_chat_completions_local(
                 crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
             ));
         }
-
-        body["model"] = json!(state.config.model.clone());
-
-        let upstream = UpstreamTarget::from(&state.config);
 
         match state.config.upstream_type {
             UpstreamType::OaiChat => {
@@ -775,6 +778,11 @@ async fn handle_responses_local(
             .unwrap_or("unknown")
             .to_string();
 
+        body["model"] = json!(state.config.model.clone());
+        // Built here, before media preprocessing: the session id derives from
+        // the conversation as the client sent it (ADR-0015).
+        let upstream = UpstreamTarget::for_request(&state.config, &headers, RESPONSES_ENTRY, &body);
+
         let media_handled = preprocess_media(&mut body, RESPONSES_ENTRY, &state).await?;
         let reqlog = setup_reqlog(&body, RESPONSES_ENTRY, &model);
         if media_handled > 0 {
@@ -783,10 +791,6 @@ async fn handle_responses_local(
                 crate::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
             ));
         }
-
-        body["model"] = json!(state.config.model.clone());
-
-        let upstream = UpstreamTarget::from(&state.config);
 
         match state.config.upstream_type {
             UpstreamType::OaiResponses => {
@@ -2307,6 +2311,7 @@ mod tests {
             listen_port: 18650,
             auth_key: None,
             override_headers: HeaderMap::new(),
+            session_header: None,
             extra_body: None,
             vision: None,
             vision_supplement_enabled: false,

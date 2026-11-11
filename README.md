@@ -82,6 +82,7 @@ listen_addr       = "127.0.0.1"          # default 127.0.0.1 (loopback only; use
 listen_port       = 18650                # default 18650
 auth_key          = "local-token"        # inbound auth for local clients; absent = auth disabled
 vision_supplement = false                # default false: images pass through untouched
+session_header    = "x-opencode-session" # header the upstream wants a per-conversation id in; absent = send none
 
 [headers]                      # extra upstream headers, overriding defaults
 X-Tenant = "default"
@@ -110,6 +111,7 @@ Key semantics:
 - `[reasoning] effort` — the single source of truth for the outgoing effort value; only stamped when the client actually asked for reasoning. No per-model mapping exists.
 - `[extra_body]` — vendor-specific JSON fields merged (recursively) into every outgoing request body for the main upstream; the configured value wins on conflict, and new keys are appended in a fixed key order so the same profile always serialises identically. It applies to all three entries and to pass-through (which is *unconverted*, not *unmodified*), but never to `[vision]` calls. Keys the proxy owns are rejected at startup rather than silently ignored: `model`, `stream`, `messages`, `input`, plus `thinking` (anthropic-messages), `reasoning_effort` (oai-chat), `reasoning.effort` (oai-responses) and `stream_options.include_usage` (oai-chat). TOML date/time values are rejected because they have no exact JSON form. (ADR-0014)
 - `[vision]` — enabled only when `url`, `api_key`, and `model` are all present and non-blank; otherwise vision logs which keys are missing and disables itself. The endpoint's format is inferred from its path today; making it an explicit declaration is a pending change (see the deviations list linked above).
+- `session_header` — names the header some upstreams use to identify one conversation across its requests (OpenCode Go requires `x-opencode-session` and answers `400` without it). Off by default, so no other upstream receives a vendor header. When set, every main-upstream request carries it: a usable client-supplied value is forwarded as sent, otherwise an id is derived from the conversation's opening (system prompt + first user message) and stays stable as the conversation grows — no state is kept. The name is validated at startup (a blank name, an unusable name, or one the proxy controls itself such as `authorization`, `host` or `content-length` fails the launch). `[headers]` with the same name still overrides it, `[vision]` calls never carry it, and the request log is unchanged. (ADR-0015)
 - Configuration comes only from the profile file, and no configuration *value* is read from the environment; `RUST_LOG` (a `tracing` filter, default `info`) is the one exception. The directory holding `~/.ai-bridge` is not configuration either: it is the platform home directory — `HOME` on POSIX, `USERPROFILE` on Windows, where `HOME` is deliberately ignored (ADR-0005).
 
 Configuration decisions and their rationale are recorded in [`docs/adr/`](docs/adr/).
@@ -135,6 +137,49 @@ curl -X POST http://127.0.0.1:18650/v1/chat/completions \
 ```
 
 Which entry converts to which upstream — and which combinations are pass-through — is laid out in [`docs/architecture.md`](docs/architecture.md) § 3.
+
+### OpenCode Go
+
+[OpenCode Go](https://opencode.ai/docs/console/go/) serves a curated coding-model list through the Console gateway. Go traffic lives under `https://opencode.ai/inference/go` (pay-as-you-go is the same host without `/go`), and every text model works through every API path — Console translates when the model's native API differs. Pick the path that matches the `upstream_type` you want and let ai-bridge do the conversion:
+
+| API path | `upstream_type` |
+| --- | --- |
+| `/anthropic/v1/messages` | `anthropic-messages` |
+| `/openai/v1/chat/completions` | `oai-chat` |
+| `/openai/v1/responses` | `oai-responses` |
+
+Go **requires** a stable per-conversation id in `x-opencode-session`: a request without it is rejected with `400 MissingSessionID` before the key is even checked. Declare `session_header` once in the profile — ai-bridge forwards a client-supplied id when there is one and otherwise derives a stable one from the conversation's opening, so later turns reuse it. Both `x-api-key` and `Authorization: Bearer` are accepted on the Anthropic-shaped path, so the default auth header works as-is.
+
+Model ids and each native model's API are listed in the [Go endpoint table](https://opencode.ai/docs/console/go/#endpoints); ai-bridge keeps no model list, so copy the id and the matching path into the profile. `url` and `upstream_type` must agree — a mismatched pair is not detected at startup, only by the upstream.
+
+```toml
+# Go — Anthropic Messages native path
+upstream_type = "anthropic-messages"
+url     = "https://opencode.ai/inference/go/anthropic/v1/messages"
+api_key = "oc_sk_..."
+model   = "<model id from the Go endpoint table>"
+session_header = "x-opencode-session"
+```
+
+```toml
+# Go — OpenAI Chat Completions native path
+upstream_type = "oai-chat"
+url     = "https://opencode.ai/inference/go/openai/v1/chat/completions"
+api_key = "oc_sk_..."
+model   = "<model id from the Go endpoint table>"
+session_header = "x-opencode-session"
+```
+
+```toml
+# Go — OpenAI Responses native path
+upstream_type = "oai-responses"
+url     = "https://opencode.ai/inference/go/openai/v1/responses"
+api_key = "oc_sk_..."
+model   = "<model id from the Go endpoint table>"
+session_header = "x-opencode-session"
+```
+
+All three local entries still work against whichever path a profile selects (§ 3): a Claude Code request to `/v1/messages` against the Chat path is converted by ai-bridge, not by Console.
 
 ## Request logging
 

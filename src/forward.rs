@@ -1,4 +1,5 @@
-use crate::error::Error;
+use crate::error::{Error, LocalEntry};
+use crate::session_id;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
@@ -66,6 +67,10 @@ pub(crate) struct Config {
     pub(crate) auth_key: Option<String>,
     /// Headers from the `[headers]` table overridden on every upstream request.
     pub(crate) override_headers: HeaderMap,
+    /// The `session_header` key: the name of the header this upstream wants a
+    /// per-conversation id in, if it wants one at all. Declared, never inferred
+    /// from the URL (ADR-0002); the id itself is per-request (ADR-0015).
+    pub(crate) session_header: Option<HeaderName>,
     /// Fields from the `[extra_body]` table merged into every outgoing request
     /// body for the main upstream (never the vision endpoint). Applied at the
     /// single outbound seam, [`build_upstream_request`], after the reasoning
@@ -345,18 +350,64 @@ pub(crate) struct UpstreamTarget {
     pub(crate) override_headers: HeaderMap,
     /// `[extra_body]` fields for this target; `None` for the vision endpoint.
     pub(crate) extra_body: Option<Value>,
+    /// Header name for the per-conversation id, from `session_header`; `None`
+    /// when the profile declares none and always `None` for the vision target.
+    pub(crate) session_header: Option<HeaderName>,
+    /// This request's conversation id. Filled in by the entry handler: the
+    /// client's own header value when it sent one, otherwise derived from the
+    /// conversation's opening by `session_id::derive`.
+    pub(crate) session_id: Option<HeaderValue>,
 }
 
-impl From<&Config> for UpstreamTarget {
-    fn from(c: &Config) -> Self {
-        UpstreamTarget {
-            url: c.url.clone(),
-            api_key: c.api_key.clone(),
-            upstream_type: c.upstream_type,
-            override_headers: c.override_headers.clone(),
-            extra_body: c.extra_body.clone(),
-        }
+impl UpstreamTarget {
+    /// Build the main-upstream target for one request, session id included.
+    ///
+    /// This is the only constructor for the main upstream — the vision target
+    /// keeps its own `From<&VisionConfig>` — so a new entry handler cannot build
+    /// a target and forget the session step (ADR-0015). `body` is the inbound
+    /// request as the client sent it, before conversion and before media
+    /// preprocessing can rewrite the conversation's opening.
+    pub(crate) fn for_request(
+        config: &Config,
+        headers: &HeaderMap,
+        entry: LocalEntry,
+        body: &Value,
+    ) -> Self {
+        let mut target = UpstreamTarget {
+            url: config.url.clone(),
+            api_key: config.api_key.clone(),
+            upstream_type: config.upstream_type,
+            override_headers: config.override_headers.clone(),
+            extra_body: config.extra_body.clone(),
+            session_header: config.session_header.clone(),
+            session_id: None,
+        };
+        target.session_id = session_identity(&target, headers, entry, body);
+        target
     }
+}
+
+/// Resolve this request's session id: the client's own value when it sent a
+/// usable one (it is the authority on which conversation this is), otherwise an
+/// id derived from the conversation's opening so later turns reuse it without
+/// the proxy keeping any state. `None` when the profile declares no header.
+fn session_identity(
+    target: &UpstreamTarget,
+    headers: &HeaderMap,
+    entry: LocalEntry,
+    body: &Value,
+) -> Option<HeaderValue> {
+    let name = target.session_header.as_ref()?;
+    let client_id = headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok());
+    Some(client_id.unwrap_or_else(|| {
+        let derived = session_id::derive(entry, body);
+        HeaderValue::from_bytes(derived.as_bytes()).expect("a derived session id is ASCII")
+    }))
 }
 
 impl From<&VisionConfig> for UpstreamTarget {
@@ -369,6 +420,10 @@ impl From<&VisionConfig> for UpstreamTarget {
             // `[extra_body]` belongs to the main upstream only: a vision call is
             // a generated describe request, and vendor fields could break it.
             extra_body: None,
+            // Same boundary for the session header: a describe call is not part
+            // of the user's conversation.
+            session_header: None,
+            session_id: None,
         }
     }
 }
@@ -415,6 +470,12 @@ fn build_upstream_request(
         http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    // A declared session header carries this request's conversation id. It is
+    // inserted before the overrides so a same-named `[headers]` entry still
+    // wins, exactly like the auth and content-type defaults above.
+    if let (Some(name), Some(id)) = (&target.session_header, &target.session_id) {
+        headers.insert(name.clone(), id.clone());
+    }
     for (name, value) in &target.override_headers {
         headers.insert(name.clone(), value.clone());
     }
@@ -593,6 +654,7 @@ mod tests {
         apply_reasoning_policy, header_overrides_from_pairs, parse_bool, parse_error_payload,
         ReasoningEffortOverride, UpstreamReasoningPolicy, UpstreamType,
     };
+    use crate::error::LocalEntry;
     use serde_json::{json, Value};
 
     #[test]
@@ -1079,6 +1141,8 @@ mod tests {
             upstream_type,
             override_headers: http::HeaderMap::new(),
             extra_body,
+            session_header: None,
+            session_id: None,
         }
     }
 
@@ -1092,6 +1156,7 @@ mod tests {
             listen_port: 18650,
             auth_key: None,
             override_headers: http::HeaderMap::new(),
+            session_header: None,
             extra_body,
             vision: None,
             vision_supplement_enabled: false,
@@ -1162,10 +1227,187 @@ mod tests {
     #[test]
     fn main_target_carries_the_configured_extra_body() {
         let extra = json!({"providerOptions": {"gateway": {"only": ["deepseek"]}}});
-        let target = super::UpstreamTarget::from(&main_config(Some(extra.clone())));
+        let target = super::UpstreamTarget::for_request(
+            &main_config(Some(extra.clone())),
+            &http::HeaderMap::new(),
+            LocalEntry::OaiChat,
+            &json!({}),
+        );
         assert_eq!(target.extra_body, Some(extra));
-        assert!(super::UpstreamTarget::from(&main_config(None))
-            .extra_body
-            .is_none());
+        let plain = super::UpstreamTarget::for_request(
+            &main_config(None),
+            &http::HeaderMap::new(),
+            LocalEntry::OaiChat,
+            &json!({}),
+        );
+        assert!(plain.extra_body.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // The session header
+    // -----------------------------------------------------------------------
+
+    fn session_target(header: &'static str, id: &'static str) -> super::UpstreamTarget {
+        let mut target = main_target(UpstreamType::OaiChat, None);
+        target.session_header = Some(http::HeaderName::from_static(header));
+        target.session_id = Some(http::HeaderValue::from_static(id));
+        target
+    }
+
+    fn sent_request(target: &super::UpstreamTarget) -> reqwest::Request {
+        super::build_upstream_request(&reqwest::Client::new(), target, json!({"model": "m"}))
+            .expect("builder")
+            .build()
+            .expect("complete request")
+    }
+
+    #[test]
+    fn build_upstream_request_sends_the_session_header() {
+        let request = sent_request(&session_target(
+            "x-opencode-session",
+            "ses_0123456789abcdef",
+        ));
+        assert_eq!(
+            request.headers().get("x-opencode-session").unwrap(),
+            "ses_0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_omits_the_session_header_when_unconfigured() {
+        let request = sent_request(&main_target(UpstreamType::OaiChat, None));
+        assert!(request.headers().get("x-opencode-session").is_none());
+    }
+
+    /// The session header is inserted before `[headers]`, so an explicit pin
+    /// (a fixed id, say) still wins — the override table is the last word.
+    #[test]
+    fn headers_table_still_wins_over_the_session_header() {
+        let mut target = session_target("x-opencode-session", "ses_derived");
+        target.override_headers.insert(
+            http::HeaderName::from_static("x-opencode-session"),
+            http::HeaderValue::from_static("ses_pinned"),
+        );
+        let request = sent_request(&target);
+        assert_eq!(
+            request.headers().get("x-opencode-session").unwrap(),
+            "ses_pinned"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-request target construction (`for_request`): the one place a session
+    // id is attached, so no entry handler can build a target without it
+    // -----------------------------------------------------------------------
+
+    fn session_config(session_header: Option<&str>) -> super::Config {
+        let mut config = main_config(None);
+        config.session_header = session_header.map(|name| name.parse().unwrap());
+        config
+    }
+
+    fn conversation() -> Value {
+        json!({
+            "model": "m",
+            "system": "you are a coding agent",
+            "messages": [{"role": "user", "content": "fix the bug"}]
+        })
+    }
+
+    fn client_headers(value: &'static str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-opencode-session", http::HeaderValue::from_static(value));
+        headers
+    }
+
+    #[test]
+    fn for_request_prefers_the_client_session_header() {
+        let target = super::UpstreamTarget::for_request(
+            &session_config(Some("x-opencode-session")),
+            &client_headers("ses_from_client"),
+            LocalEntry::AnthropicMessages,
+            &conversation(),
+        );
+        assert_eq!(target.session_id.unwrap(), "ses_from_client");
+    }
+
+    #[test]
+    fn for_request_derives_a_stable_id_across_turns() {
+        let config = session_config(Some("x-opencode-session"));
+        let first = super::UpstreamTarget::for_request(
+            &config,
+            &http::HeaderMap::new(),
+            LocalEntry::AnthropicMessages,
+            &conversation(),
+        )
+        .session_id
+        .expect("derived id");
+        assert!(first.to_str().unwrap().starts_with("ses_"));
+
+        // A later turn keeps the opening and appends messages; the handler has
+        // already replaced the model by the time the id is derived.
+        let mut later = conversation();
+        later["model"] = json!("profile-model");
+        later["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "assistant", "content": "looking"}));
+        let later = super::UpstreamTarget::for_request(
+            &config,
+            &http::HeaderMap::new(),
+            LocalEntry::AnthropicMessages,
+            &later,
+        )
+        .session_id
+        .expect("derived id");
+        assert_eq!(later, first);
+    }
+
+    #[test]
+    fn for_request_falls_back_when_the_client_value_is_blank() {
+        let target = super::UpstreamTarget::for_request(
+            &session_config(Some("x-opencode-session")),
+            &client_headers("   "),
+            LocalEntry::AnthropicMessages,
+            &conversation(),
+        );
+        assert!(target
+            .session_id
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("ses_"));
+    }
+
+    #[test]
+    fn for_request_without_a_configured_header_carries_no_session() {
+        let target = super::UpstreamTarget::for_request(
+            &session_config(None),
+            &client_headers("ses_from_client"),
+            LocalEntry::AnthropicMessages,
+            &conversation(),
+        );
+        assert!(target.session_header.is_none());
+        assert!(target.session_id.is_none());
+    }
+
+    /// A vision call is a generated describe request, not part of the user's
+    /// conversation: it never carries the session header, even when the main
+    /// upstream declares one.
+    #[test]
+    fn vision_target_never_carries_a_session_header() {
+        let vision = super::VisionConfig {
+            url: "https://v.example/v1/chat/completions".into(),
+            api_key: "k".into(),
+            model: "vl".into(),
+            upstream_type: UpstreamType::OaiChat,
+            override_headers: http::HeaderMap::new(),
+            prompt_mode: "auto".into(),
+            custom_prompt: None,
+            max_tokens: None,
+        };
+        let target = super::UpstreamTarget::from(&vision);
+        assert!(target.session_header.is_none());
+        assert!(target.session_id.is_none());
     }
 }

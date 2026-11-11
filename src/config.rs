@@ -3,6 +3,7 @@ use crate::forward::{
     header_overrides_from_pairs, vision_upstream_type_from_url, Config, UpstreamReasoningPolicy,
     UpstreamType, VisionConfig,
 };
+use http::header::HeaderName;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,15 @@ const DEFAULT_TEMPLATE: &str = r#"# ai-bridge config profile — this file is au
 # Third-party vision supplement toggle, default false: images are passed
 # through to the upstream as-is and handled by the upstream's own vision.
 #vision_supplement = false
+
+# Outbound session header (optional): names a header the upstream uses to
+# identify one conversation across its requests, e.g. "x-opencode-session"
+# for OpenCode Go, which rejects requests without it. When set, every
+# main-upstream request carries it: the local client's own value if it sent
+# one, otherwise an id derived from the conversation's opening (system prompt
+# + first user message), so later turns reuse the same id with no state kept.
+# Vision calls never carry it; a same-named `[headers]` entry still wins.
+#session_header = "x-opencode-session"
 
 # Additional upstream request headers, overriding same-named default headers.
 #[headers]
@@ -341,6 +351,9 @@ struct RawProfile {
     auth_key: Option<String>,
     #[serde(default)]
     vision_supplement: Option<bool>,
+    /// Header name the upstream wants a per-conversation id in, if any.
+    #[serde(default)]
+    session_header: Option<String>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
     /// Free-form `[extra_body]` table, merged into every outgoing request body
@@ -387,6 +400,7 @@ fn build_config(raw: RawProfile) -> Result<Config, Error> {
     let upstream_type = UpstreamType::parse(&raw.upstream_type)?;
 
     let override_headers = header_overrides_from_pairs("[headers]", raw.headers);
+    let session_header = parse_session_header(raw.session_header.as_deref())?;
     let extra_body = build_extra_body(upstream_type, raw.extra_body)?;
 
     // Stringify back into the shared parser so accepted spellings (and the
@@ -414,6 +428,7 @@ fn build_config(raw: RawProfile) -> Result<Config, Error> {
         // matching the documented caveat of the removed UPSTREAM_AUTH_KEY.
         auth_key: raw.auth_key,
         override_headers,
+        session_header,
         extra_body,
         vision,
         vision_supplement_enabled: raw.vision_supplement.unwrap_or(false),
@@ -425,6 +440,52 @@ fn build_config(raw: RawProfile) -> Result<Config, Error> {
 /// after trimming.
 fn non_blank(v: Option<&str>) -> Option<&str> {
     v.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Parse the optional `session_header` key into a header name.
+///
+/// Validated at startup: an unusable name would otherwise surface as a request
+/// that silently lacks the header an upstream such as OpenCode Go requires,
+/// and the failure would be an upstream 400 far from the typo. The proxy's own
+/// headers are rejected too — pointing `session_header` at `authorization`
+/// would replace the API key with a conversation id, turning a typo into an
+/// authentication failure.
+fn parse_session_header(raw: Option<&str>) -> Result<Option<HeaderName>, Error> {
+    /// Headers `build_upstream_request` writes itself.
+    const PROXY_OWNED_HEADERS: [&str; 8] = [
+        "authorization",
+        "x-api-key",
+        "content-type",
+        "anthropic-version",
+        // Framing headers: a conversation id in any of these corrupts the
+        // request rather than reaching the upstream.
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+    ];
+
+    let Some(raw) = raw else { return Ok(None) };
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(Error::Config(
+            "session_header is set but blank; name the header the upstream expects \
+             (e.g. \"x-opencode-session\") or remove the key"
+                .into(),
+        ));
+    }
+    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+        Error::Config(format!(
+            "Invalid session_header \"{name}\": not a usable HTTP header name ({e})"
+        ))
+    })?;
+    if PROXY_OWNED_HEADERS.contains(&name.as_str()) {
+        return Err(Error::Config(format!(
+            "Invalid session_header \"{name}\": the proxy writes that header itself; \
+             name the upstream's session header instead (e.g. \"x-opencode-session\")"
+        )));
+    }
+    Ok(Some(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +812,7 @@ api_key = "sk-test"
         assert_eq!(cfg.auth_key, None);
         assert!(!cfg.vision_supplement_enabled);
         assert!(cfg.override_headers.is_empty());
+        assert!(cfg.session_header.is_none());
         assert!(cfg.extra_body.is_none());
         assert!(cfg.vision.is_none());
         assert!(cfg.reasoning_policy.thinking_enabled);
@@ -897,6 +959,73 @@ X-V = "1"
             "upstream_type = \"bogus\"\nurl = \"https://x\"\napi_key = \"k\"\n",
         );
         assert!(err.contains("upstream_type"), "err: {err}");
+    }
+
+    #[test]
+    fn session_header_is_parsed_and_normalized() {
+        let dir = tempdir().unwrap();
+        write_profile(
+            dir.path(),
+            "p",
+            "upstream_type = \"oai-chat\"\nurl = \"https://x\"\napi_key = \"k\"\n\
+             session_header = \"  X-Opencode-Session \"\n",
+        );
+        let cfg = load_minimal(dir.path()).config;
+        assert_eq!(
+            cfg.session_header.expect("configured").as_str(),
+            "x-opencode-session"
+        );
+    }
+
+    /// A blank or unusable name must fail the launch: the failure it would
+    /// otherwise cause is an upstream 400 far from the typo.
+    #[test]
+    fn blank_session_header_is_rejected() {
+        let dir = tempdir().unwrap();
+        let err = load_err(
+            dir.path(),
+            "bad",
+            "upstream_type = \"oai-chat\"\nurl = \"https://x\"\napi_key = \"k\"\n\
+             session_header = \"   \"\n",
+        );
+        assert!(err.contains("session_header"), "err: {err}");
+    }
+
+    #[test]
+    fn invalid_session_header_name_is_rejected() {
+        let dir = tempdir().unwrap();
+        let err = load_err(
+            dir.path(),
+            "bad",
+            "upstream_type = \"oai-chat\"\nurl = \"https://x\"\napi_key = \"k\"\n\
+             session_header = \"not a header\"\n",
+        );
+        assert!(err.contains("session_header"), "err: {err}");
+    }
+
+    /// `session_header` must name the upstream's header, not one the proxy
+    /// writes: `authorization` would swap the API key for a conversation id.
+    #[test]
+    fn proxy_owned_session_header_name_is_rejected() {
+        // Credentials and request framing alike: the session id would replace
+        // the value the proxy must control.
+        for (name, needle) in [
+            ("Authorization", "authorization"),
+            ("Host", "host"),
+            ("Content-Length", "content-length"),
+        ] {
+            let dir = tempdir().unwrap();
+            let err = load_err(
+                dir.path(),
+                name,
+                &format!(
+                    "upstream_type = \"oai-chat\"\nurl = \"https://x\"\napi_key = \"k\"\n\
+                     session_header = \"{name}\"\n"
+                ),
+            );
+            assert!(err.contains("session_header"), "{name}: {err}");
+            assert!(err.contains(needle), "{name}: {err}");
+        }
     }
 
     #[test]
