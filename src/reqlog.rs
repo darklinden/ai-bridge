@@ -3,12 +3,15 @@
 //! Prints a line-oriented streaming log per request, independent of `RUST_LOG`:
 //!
 //! ```text
-//! [REQ #0001]: claude-sonnet-5 hello, please do something ...
-//! [RESP #0001]: Hello! This is the response text, streamed live onto one line...
+//! [REQ #0001]: claude-sonnet-5 hello, please do something ... [body=412B stream=on]
+//! [RESP #0001] after=1834ms: Hello! This is the response text, streamed live...
 //! ```
 //!
-//! Streaming text is appended onto the same open `[RESP #id]: ` line (no repeated
-//! header per chunk) and terminated with a newline on completion. Errors break to
+//! Streaming text is appended onto the same open `[RESP #id] after={ms}: ` line (no
+//! repeated header per chunk) and terminated with a newline on completion. The
+//! `after=` figure is the wait from the `[REQ]` line to the first response byte:
+//! upload/queue/prefill all land in it, which is what makes a slow turn
+//! attributable. Errors break to
 //! a tagged `[ERR-REQ #id]` / `[ERR-RESP #id]` line.
 //!
 //! Tool calls and their results are part of those same lines, rendered by
@@ -177,6 +180,8 @@ pub(crate) fn flush_open_tools<K, S>(
 
 pub struct ReqLog {
     id: String,
+    /// When this request's log was opened: the zero point of `[RESP] after=Nms`.
+    started: std::time::Instant,
     header_printed: AtomicBool,
     done: AtomicBool,
     /// The buffer a captured handle diverts its output into, installed by
@@ -194,6 +199,7 @@ impl ReqLog {
         let id = format!("{:04x}", n & 0xffff);
         Arc::new(ReqLog {
             id,
+            started: std::time::Instant::now(),
             header_printed: AtomicBool::new(false),
             done: AtomicBool::new(false),
             #[cfg(test)]
@@ -241,15 +247,19 @@ impl ReqLog {
         self.write(note);
     }
 
-    /// Begin a response line: prints `[RESP #id]: {prefix}` with NO trailing newline.
-    /// For streaming, call with `""` so text appends directly after `": "`.
+    /// Begin a response line: prints `[RESP #id] after={ms}: {prefix}` with NO
+    /// trailing newline, where `{ms}` is the wait since this log was opened (the
+    /// `[REQ]` line) — the number that separates upstream queue/prefill from
+    /// actual generation. For streaming, call with `""` so text appends directly
+    /// after `": "`.
     /// Preceded by two blank lines to visually separate the response from the
     /// previous request/response pair.
     pub fn resp_header(&self, prefix: &str) {
         if self.header_printed.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.write(&format!("\n\n[RESP #{}]: {prefix}", self.id));
+        let after_ms = self.started.elapsed().as_millis();
+        self.write(&format!("\n\n[RESP #{}] after={}ms: {prefix}", self.id, after_ms));
     }
 
     /// Append text to the open response line (no newline). No-op if never started.
@@ -293,6 +303,22 @@ impl ReqLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resp_header_records_the_wait_before_the_first_byte() {
+        let (log, buf) = ReqLog::captured();
+        log.req("m hello [body=12B stream=on]");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        log.resp_header("");
+        log.done();
+        let text = buf.lock().unwrap().clone();
+        assert!(text.contains("[REQ #"), "{text}");
+        assert!(text.contains("[RESP #"), "{text}");
+        // The `after=` figure is the whole point: it separates queue/prefill
+        // from generation, so it must be present on every response line.
+        assert!(text.contains("after="), "{text}");
+        assert!(text.contains("ms: "), "{text}");
+    }
 
     #[test]
     fn tool_use_marker_appends_args_verbatim() {
@@ -388,7 +414,9 @@ mod tests {
         assert!(text.starts_with("\n\n[REQ #"));
         assert!(text.contains("]: model hello\n"));
         assert!(text.contains("[RESP #"));
-        assert!(text.contains("]: [tool_use: bash] {}\n"));
+        // The header carries the `after=` wait, so the appended text follows
+        // `ms: ` rather than the bare `]: ` of the old format.
+        assert!(text.contains("ms: [tool_use: bash] {}\n"), "{text}");
     }
 
     #[test]

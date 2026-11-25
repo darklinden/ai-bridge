@@ -387,11 +387,16 @@ fn authenticate(headers: &HeaderMap, expected: Option<&str>) -> Result<(), Error
 
 /// Shared reqlog setup: emit the system prompt (deduped) and the `[REQ #id]`
 /// line. Returns the ReqLog handle.
-fn setup_reqlog(body: &Value, entry: LocalEntry, model: &str) -> Arc<ReqLog> {
+fn setup_reqlog(body: &Value, entry: LocalEntry, model: &str, is_stream: bool) -> Arc<ReqLog> {
     crate::reqlog::report_system_prompt(extract_system_for_entry(body, entry).as_deref());
     let reqlog = crate::reqlog::ReqLog::new();
     let req_text = request_text_for_entry(body, entry);
-    let req_summary = format!("{model} {req_text}");
+    // Entry-body size, not the exact outbound body: reasoning policy and
+    // `[extra_body]` are applied after this point and move the figure by bytes,
+    // not kilobytes — enough to tell "2MB upload" from "60KB upload" at a glance.
+    let body_bytes = serde_json::to_vec(body).map(|v| v.len()).unwrap_or(0);
+    let stream = if is_stream { "on" } else { "off" };
+    let req_summary = format!("{model} {req_text} [body={body_bytes}B stream={stream}]");
     reqlog.req(&req_summary);
     reqlog
 }
@@ -659,7 +664,7 @@ async fn handle_messages(
         let upstream = UpstreamTarget::for_request(&state.config, &headers, ANTHROPIC_ENTRY, &body);
 
         let media_handled = preprocess_media(&mut body, ANTHROPIC_ENTRY, &state).await?;
-        let reqlog = setup_reqlog(&body, ANTHROPIC_ENTRY, &model);
+        let reqlog = setup_reqlog(&body, ANTHROPIC_ENTRY, &model, is_stream);
         if media_handled > 0 {
             reqlog.append_media_note(&format!(
                 " [media: {media_handled} image(s) → {}]",
@@ -725,7 +730,7 @@ async fn handle_chat_completions_local(
         let upstream = UpstreamTarget::for_request(&state.config, &headers, CHAT_ENTRY, &body);
 
         let media_handled = preprocess_media(&mut body, CHAT_ENTRY, &state).await?;
-        let reqlog = setup_reqlog(&body, CHAT_ENTRY, &model);
+        let reqlog = setup_reqlog(&body, CHAT_ENTRY, &model, is_stream);
         if media_handled > 0 {
             reqlog.append_media_note(&format!(
                 " [media: {media_handled} image(s) → {}]",
@@ -784,7 +789,7 @@ async fn handle_responses_local(
         let upstream = UpstreamTarget::for_request(&state.config, &headers, RESPONSES_ENTRY, &body);
 
         let media_handled = preprocess_media(&mut body, RESPONSES_ENTRY, &state).await?;
-        let reqlog = setup_reqlog(&body, RESPONSES_ENTRY, &model);
+        let reqlog = setup_reqlog(&body, RESPONSES_ENTRY, &model, is_stream);
         if media_handled > 0 {
             reqlog.append_media_note(&format!(
                 " [media: {media_handled} image(s) → {}]",

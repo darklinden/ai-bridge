@@ -1262,10 +1262,13 @@ mod tests {
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"after\"}}\n\n".to_string(),
         ];
         let logged = run_chat_sse_logged(frames, true).await;
-        let marker = logged
+        // Search only the streamed text: the `[RESP]` header now carries an
+        // `after={ms}` wait, whose word would otherwise match the payload below.
+        let streamed = &logged[logged.find("ms: ").map(|i| i + 4).unwrap_or(0)..];
+        let marker = streamed
             .find("[tool_use: f] {\"a\":1}")
             .unwrap_or_else(|| panic!("log was: {logged}"));
-        let text = logged
+        let text = streamed
             .find("after")
             .unwrap_or_else(|| panic!("log was: {logged}"));
         assert!(marker < text, "marker must precede later text: {logged}");
