@@ -877,10 +877,11 @@ struct ToolBlockState {
 
 /// A tool block that is open on the wire and still accumulating arguments.
 ///
-/// The `[RESP]` line cannot be written when the block opens — the arguments only
-/// arrive as later deltas — so the name and the accumulated JSON wait here until
-/// the block closes. The flush itself lives in [`crate::reqlog::flush_open_tools`],
-/// shared with the other streaming paths.
+/// The head of the `[RESP]` line entry can be written when the block is named
+/// (`tool.begin`), and each later delta is appended as it arrives
+/// (`tool.stream_args`); [`crate::reqlog::ToolCall::settle`] writes the rest when
+/// the block closes. The flush itself lives in
+/// [`crate::reqlog::flush_open_tools`], shared with the other streaming paths.
 type OpenTool = crate::reqlog::ToolCall;
 
 /// Convert OpenAI Chat SSE stream to Anthropic SSE stream.
@@ -919,6 +920,9 @@ where
         let mut reasoning_sequence: u64 = 0;
         let mut tool_blocks_by_index: std::collections::HashMap<usize, ToolBlockState> = std::collections::HashMap::new();
         let mut open_tools: std::collections::HashMap<u32, OpenTool> = std::collections::HashMap::new();
+        // Only one call may have text on the line at a time (see `ToolLine`):
+        // parallel calls that arrive before the first closes settle whole.
+        let mut tool_line: crate::reqlog::ToolLine<u32> = Default::default();
         let mut has_sent_message_stop = false;
         let mut stream_ended_with_error = false;
 
@@ -1240,18 +1244,20 @@ where
                                                     };
 
                                                     if should_start {
-                                                        // Arguments may already have arrived before
-                                                        // the block could open; fold them in so the
-                                                        // log gets the whole call at close time.
-                                                        open_tools.insert(
-                                                            anthropic_index,
-                                                            OpenTool::open(
-                                                                &name,
-                                                                pending_after_start
-                                                                    .as_deref()
-                                                                    .unwrap_or(""),
-                                                            ),
-                                                        );
+                                                        // The head goes on the log line as soon as
+                                                        // the block can be named; arguments that
+                                                        // arrived before this point are folded in
+                                                        // behind it, the rest follows as it streams.
+                                                        // Claiming only decides whether the text is
+                                                        // written now; the arguments are always
+                                                        // folded in, so a call that has to wait for
+                                                        // the line still carries them.
+                                                        let mut tool = OpenTool::open(&name, "");
+                                                        tool_line.begin_tool(&anthropic_index, &mut tool, &reqlog);
+                                                        if let Some(args) = pending_after_start.as_deref() {
+                                                            tool.stream_args(&reqlog, args);
+                                                        }
+                                                        open_tools.insert(anthropic_index, tool);
 
                                                         let event = json!({
                                                             "type": "content_block_start",
@@ -1287,7 +1293,7 @@ where
 
                                                     if let Some(args) = &immediate_delta {
                                                         if let Some(open) = open_tools.get_mut(&anthropic_index) {
-                                                            open.push_args(args);
+                                                            open.stream_args(&reqlog, args);
                                                         }
                                                     }
 
@@ -1381,7 +1387,10 @@ where
                                                 // arguments buffered before this point are the
                                                 // model's actual input, so the log keeps them
                                                 // even though the emitted stream drops them.
-                                                open_tools.insert(index, OpenTool::open(&name, &pending));
+                                                let mut tool = OpenTool::open(&name, "");
+                                                tool_line.begin_tool(&index, &mut tool, &reqlog);
+                                                tool.stream_args(&reqlog, &pending);
+                                                open_tools.insert(index, tool);
                                                 let event = json!({
                                                     "type": "content_block_start",
                                                     "index": index,
@@ -1398,13 +1407,13 @@ where
                                                 yield Ok(Bytes::from(sse_data));
                                             }
 
-                                            // Close tool blocks, writing each call's complete
-                                            // `[tool_use: name] {arguments}` onto the log line.
+                                            // Close tool blocks; each writes only what is not
+                                            // already on the log line yet.
                                             let mut tool_indices: Vec<u32> = open_tools.keys().copied().collect();
                                             tool_indices.sort_unstable();
                                             for index in tool_indices {
-                                                if let Some(tool) = open_tools.remove(&index) {
-                                                    reqlog.append(&tool.marker());
+                                                if let Some(mut tool) = open_tools.remove(&index) {
+                                                    tool_line.settle_tool(&index, &mut tool, &reqlog);
                                                 }
                                                 let event = json!({
                                                     "type": "content_block_stop",
@@ -1443,7 +1452,7 @@ where
                     yield Ok(Bytes::from(sse_data));
                     // `err_resp` closes the log line, so a tool call still open
                     // has to be written before it.
-                    crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
+                    crate::reqlog::flush_open_tools(&mut open_tools, &mut tool_line, &reqlog);
                     reqlog.err_resp(&format!("Stream error: {e}"));
                     break;
                 }
@@ -1495,7 +1504,7 @@ where
 
             // An upstream that ended without a finish_reason leaves tool blocks
             // open; their calls still belong on the log line.
-            crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
+            crate::reqlog::flush_open_tools(&mut open_tools, &mut tool_line, &reqlog);
 
             reqlog.done();
         }
@@ -1792,6 +1801,64 @@ mod tests {
         logged
     }
 
+    /// `data: {json}\n\n` — the frame shape `take_sse_block` frames on.
+    fn chat_frame(json: &str) -> String {
+        format!("data: {json}\n\n")
+    }
+
+    /// Like `run_logged`, but snapshots the log line after every forwarded
+    /// event: the line as it was being built, not just its final text.
+    async fn run_log_snapshots(frames: Vec<String>) -> Vec<String> {
+        let upstream = futures::stream::iter(
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
+        let (reqlog, captured) = ReqLog::captured();
+        let mut out = Box::pin(chat_to_anthropic_sse(
+            upstream,
+            "claude-sonnet-5".to_string(),
+            reqlog,
+        ));
+        let mut snapshots = Vec::new();
+        while let Some(item) = out.next().await {
+            item.unwrap();
+            snapshots.push(captured.lock().unwrap().clone());
+        }
+        snapshots
+    }
+
+    #[tokio::test]
+    async fn chat_sse_writes_tool_arguments_while_they_stream() {
+        // The head reaches the line when the call is named, the arguments as
+        // their deltas arrive — a call is never held back until it closes.
+        let snaps = run_log_snapshots(vec![
+            chat_frame(r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"t_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}"#),
+            chat_frame(r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}"#),
+            chat_frame(r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"SF\"}"}}]}}]}"#),
+            chat_frame(r#"{"id":"1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+            chat_frame("[DONE]"),
+        ])
+        .await;
+
+        let head = snaps
+            .iter()
+            .position(|snap| snap.contains("[tool_use: get_weather]"))
+            .unwrap_or_else(|| panic!("the head never reached the line: {snaps:?}"));
+        let args = snaps
+            .iter()
+            .position(|snap| snap.contains("{\"city\":\"SF\"}"))
+            .unwrap_or_else(|| panic!("the arguments never reached the line: {snaps:?}"));
+        assert!(
+            head < args,
+            "head and arguments landed in the same write: {snaps:?}"
+        );
+        assert!(
+            args + 1 < snaps.len(),
+            "the arguments only landed with the stream's terminal events: {snaps:?}"
+        );
+    }
+
     #[tokio::test]
     async fn chat_sse_logs_tool_use_with_the_whole_arguments() {
         let logged = run_logged(vec![
@@ -1803,6 +1870,46 @@ mod tests {
         .await;
         assert!(
             logged.contains("[tool_use: get_weather] {\"city\":\"SF\"}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_keeps_parallel_tool_calls_apart() {
+        // Two calls open before the first one closes. The second must not write
+        // its head while the first is still streaming, or the first one's
+        // arguments would end up under the second one's name.
+        let logged = run_logged(vec![
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c0\",\"type\":\"function\",\"function\":{\"name\":\"first\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"second\",\"arguments\":\"{\\\"b\\\":\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"2}\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        assert!(
+            logged.contains("[tool_use: first] {\"a\":1}[tool_use: second] {\"b\":2}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_keeps_arguments_that_arrive_before_a_busy_calls_name() {
+        // The second call's arguments arrive before its name, while the first
+        // call still owns the line. It cannot write yet — but it must not lose
+        // the arguments it already received.
+        let logged = run_logged(vec![
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c0\",\"type\":\"function\",\"function\":{\"name\":\"first\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"b\\\":2}\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"second\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        assert!(
+            logged.contains("[tool_use: first] {\"a\":1}[tool_use: second] {\"b\":2}"),
             "log was: {logged}"
         );
     }

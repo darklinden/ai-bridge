@@ -131,10 +131,11 @@ where
 
         // Tool tracking
         let mut tool_index_by_item_id: HashMap<String, u32> = HashMap::new();
-        // Open function_call blocks, keyed by their Anthropic content index. The
-        // `[RESP]` marker is written when the block closes, once its arguments
-        // are whole.
+        // Open function_call blocks, keyed by their Anthropic content index. A
+        // named block streams onto the `[RESP]` line as its arguments arrive.
         let mut open_tools: HashMap<u32, crate::reqlog::ToolCall> = HashMap::new();
+        // Only one call may have text on the line at a time (see `ToolLine`).
+        let mut tool_line: crate::reqlog::ToolLine<u32> = Default::default();
 
         // Reasoning tracking
         let mut reasoning_index_by_item_id: HashMap<String, u32> = HashMap::new();
@@ -410,7 +411,11 @@ where
                                         // still tracked: the client receives the
                                         // same nameless block, so the log records
                                         // it as `[tool_use: ?]` rather than hiding it.
-                                        open_tools.insert(index, crate::reqlog::ToolCall::open(&name, ""));
+                                        // A named one gets its head on the log line
+                                        // right away; the argument deltas follow.
+                                        let mut tool = crate::reqlog::ToolCall::open(&name, "");
+                                        tool_line.begin_tool(&index, &mut tool, &reqlog);
+                                        open_tools.insert(index, tool);
 
                                         let event = json!({
                                             "type": "content_block_start",
@@ -498,9 +503,10 @@ where
                                     .unwrap_or("");
                                 if let Some(delta) = json_data.get("delta").and_then(|v| v.as_str()) {
                                     if let Some(&index) = tool_index_by_item_id.get(item_id) {
-                                        // Append to accumulated args
+                                        // Accumulate and, once the head is out, put the
+                                        // fragment on the log line as it arrives.
                                         let tool = open_tools.entry(index).or_default();
-                                        tool.push_args(delta);
+                                        tool.stream_args(&reqlog, delta);
 
                                         // Infinite whitespace detection
                                         if tool.args.len() > tool.args.trim_end().len() + INFINITE_WHITESPACE_THRESHOLD {
@@ -570,11 +576,12 @@ where
                                 match item_type {
                                     "function_call" => {
                                         if let Some(&index) = tool_index_by_item_id.get(item_id) {
-                                            // The call is complete: its arguments are whole, so
-                                            // the log line gets the full marker now. The item's
-                                            // own `arguments` covers an upstream that never sent
-                                            // them as deltas (the forwarded stream drops those
-                                            // either way; the log mirrors what the upstream sent).
+                                            // The call is complete: its arguments are whole.
+                                            // The item's own `arguments` covers an upstream that
+                                            // never sent them as deltas (the forwarded stream
+                                            // drops those either way; the log mirrors what the
+                                            // upstream sent); whatever is still missing reaches
+                                            // the log line here.
                                             if let Some(tool) = open_tools.get_mut(&index) {
                                                 if let Some(args) =
                                                     item.get("arguments").and_then(Value::as_str)
@@ -582,10 +589,8 @@ where
                                                     tool.resolve_args(args);
                                                 }
                                             }
-                                            if let Some(marker) =
-                                                open_tools.remove(&index).map(|tool| tool.marker())
-                                            {
-                                                reqlog.append(&marker);
+                                            if let Some(mut tool) = open_tools.remove(&index) {
+                                                tool_line.settle_tool(&index, &mut tool, &reqlog);
                                             }
                                             let event = json!({
                                                 "type": "content_block_stop",
@@ -663,11 +668,10 @@ where
                                 open_sorted.sort_unstable();
                                 for index in open_sorted {
                                     // A tool block that never got its own
-                                    // `output_item.done` still has a complete call.
-                                    if let Some(marker) =
-                                        open_tools.remove(&index).map(|tool| tool.marker())
-                                    {
-                                        reqlog.append(&marker);
+                                    // `output_item.done` still has a complete call;
+                                    // only the part not yet on the line is written.
+                                    if let Some(mut tool) = open_tools.remove(&index) {
+                                        tool_line.settle_tool(&index, &mut tool, &reqlog);
                                     }
                                     let event = json!({
                                         "type": "content_block_stop",
@@ -729,7 +733,7 @@ where
                             yield Ok(Bytes::from(sse_data));
                             // `err_resp` closes the log line, so a tool call
                             // still open has to be written before it.
-                            crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
+                            crate::reqlog::flush_open_tools(&mut open_tools, &mut tool_line, &reqlog);
                             reqlog.err_resp(&error_msg);
                             break;
                         }
@@ -750,7 +754,7 @@ where
                         serde_json::to_string(&error_event).unwrap_or_default()
                     );
                     yield Ok(Bytes::from(sse_data));
-                    crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
+                    crate::reqlog::flush_open_tools(&mut open_tools, &mut tool_line, &reqlog);
                     reqlog.err_resp(&format!("Stream error: {e}"));
                     break;
                 }
@@ -803,7 +807,7 @@ where
             }
 
             // Safety net for a stream that ended without finalising its tools.
-            crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
+            crate::reqlog::flush_open_tools(&mut open_tools, &mut tool_line, &reqlog);
 
             reqlog.done();
         }
@@ -1639,6 +1643,71 @@ mod tests {
         assert_eq!(result["output_tokens"], 20);
         assert!(result.get("cache_read_input_tokens").is_none());
         assert!(result.get("cache_creation_input_tokens").is_none());
+    }
+
+    /// Like `run_logged`, but snapshots the log line after every forwarded
+    /// event: the line as it was being built, not just its final text.
+    async fn run_log_snapshots(frames: Vec<String>) -> Vec<String> {
+        let upstream = futures::stream::iter(
+            frames
+                .into_iter()
+                .map(|f| Ok::<Bytes, Infallible>(Bytes::from(f))),
+        );
+        let (reqlog, captured) = ReqLog::captured();
+        let mut out = Box::pin(responses_to_anthropic_sse(
+            upstream,
+            "gpt-4o".to_string(),
+            reqlog,
+        ));
+        let mut snapshots = Vec::new();
+        while let Some(item) = out.next().await {
+            item.unwrap();
+            snapshots.push(captured.lock().unwrap().clone());
+        }
+        snapshots
+    }
+
+    #[tokio::test]
+    async fn logs_tool_arguments_while_they_stream() {
+        // The head reaches the line at `output_item.added`, the arguments as
+        // their deltas arrive — never only at `output_item.done`.
+        let snaps = run_log_snapshots(vec![
+            sse_block("response.created", &json!({"id": "resp_1"})),
+            sse_block(
+                "response.output_item.added",
+                &json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather"}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"city\":"}),
+            ),
+            sse_block(
+                "response.function_call_arguments.delta",
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "\"SF\"}"}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"type": "function_call", "id": "fc_1"}),
+            ),
+        ])
+        .await;
+
+        let head = snaps
+            .iter()
+            .position(|snap| snap.contains("[tool_use: get_weather]"))
+            .unwrap_or_else(|| panic!("the head never reached the line: {snaps:?}"));
+        let args = snaps
+            .iter()
+            .position(|snap| snap.contains("{\"city\":\"SF\"}"))
+            .unwrap_or_else(|| panic!("the arguments never reached the line: {snaps:?}"));
+        assert!(
+            head < args,
+            "head and arguments landed in the same write: {snaps:?}"
+        );
+        assert!(
+            args + 1 < snaps.len(),
+            "the arguments only landed with the terminal events: {snaps:?}"
+        );
     }
 
     #[tokio::test]

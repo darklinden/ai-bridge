@@ -382,8 +382,15 @@ where
         // events (real OpenAI Responses sends these too).
         let mut block_out: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
         let mut block_is_tool: std::collections::BTreeMap<usize, bool> = std::collections::BTreeMap::new();
-        // Output indices whose `[tool_use: …]` marker is already on the log line.
+        // Output indices whose tool block already reached the log line once; a
+        // repeated stop frame must not record the same call again.
         let mut logged_tools: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Calls whose arguments are already streaming onto the log line, keyed by
+        // output index; a call is settled (and removed) when its block closes.
+        let mut tool_log: std::collections::BTreeMap<usize, crate::reqlog::ToolCall> =
+            std::collections::BTreeMap::new();
+        // Only one call may have text on the line at a time (see `ToolLine`).
+        let mut tool_line: crate::reqlog::ToolLine<usize> = Default::default();
         let mut msg_status: &str = "completed";
         let mut response_usage: Option<Value> = None;
 
@@ -456,6 +463,13 @@ where
                                             let name = b.get("name").and_then(Value::as_str).unwrap_or("");
                                             fc_meta.insert(tool_item_count, (id.to_string(), name.to_string()));
                                             fc_args.insert(tool_item_count, String::new());
+                                            if log_resp {
+                                                // The head goes on the log line now; the
+                                                // argument deltas follow as they arrive.
+                                                let mut tool = crate::reqlog::ToolCall::open(name, "");
+                                                tool_line.begin_tool(&tool_item_count, &mut tool, &reqlog);
+                                                tool_log.insert(tool_item_count, tool);
+                                            }
                                             let item = json!({
                                                 "type": "response.output_item.added",
                                                 "output_index": tool_item_count,
@@ -495,6 +509,11 @@ where
                                         Some("input_json_delta") => {
                                             let partial = d.get("partial_json").and_then(Value::as_str).unwrap_or("");
                                             fc_args.entry(tool_item_count).or_default().push_str(partial);
+                                            if log_resp {
+                                                if let Some(tool) = tool_log.get_mut(&tool_item_count) {
+                                                    tool.stream_args(&reqlog, partial);
+                                                }
+                                            }
                                             let delta = json!({
                                                 "type": "response.function_call_arguments.delta",
                                                 "item_id": format!("fc_{}", tool_item_count),
@@ -523,18 +542,19 @@ where
                                         .get(&oidx)
                                         .cloned()
                                         .unwrap_or_else(|| ("".to_string(), "".to_string()));
-                                    // The call is complete, so the log line gets the whole
-                                    // `[tool_use: name] {arguments}` marker now. A block the
-                                    // upstream never named is rendered `[tool_use: ?]`, the
-                                    // same way the request-line extractors render one. The
-                                    // `logged_tools` check is what keeps a repeated stop
-                                    // frame (a replayed or non-conforming stream) from
-                                    // writing the same call twice.
+                                    // The call is complete: whatever has not reached the log
+                                    // line yet is written now. A block the upstream never named
+                                    // is rendered `[tool_use: ?]`, the same way the request-line
+                                    // extractors render one. The `logged_tools` check is what
+                                    // keeps a repeated stop frame (a replayed or non-conforming
+                                    // stream) from writing the same call twice.
                                     if log_resp && logged_tools.insert(oidx) {
-                                        crate::reqlog::append_markers(
-                                            &reqlog,
-                                            [crate::reqlog::ToolCall::open(&name, &args)],
-                                        );
+                                        // A stop for a block whose start never opened a log
+                                        // entry still records the call in one piece.
+                                        let mut tool = tool_log.remove(&oidx).unwrap_or_else(|| {
+                                            crate::reqlog::ToolCall::open(&name, &args)
+                                        });
+                                        tool_line.settle_tool(&oidx, &mut tool, &reqlog);
                                     }
                                     let args_done = json!({
                                         "type": "response.function_call_arguments.done",
@@ -653,7 +673,7 @@ where
                     if log_resp {
                         // `err_resp` closes the log line, so a tool call still
                         // open has to be written before it.
-                        flush_open_tools(&fc_meta, &fc_args, &mut logged_tools, &reqlog);
+                        flush_open_tools(&mut tool_log, &mut tool_line, &reqlog);
                         reqlog.err_resp(&format!("Stream error: {e}"));
                     }
                     break;
@@ -661,39 +681,29 @@ where
             }
         }
         // A tool block the upstream never closed still has its arguments on the
-        // log line, in output-index order. `fc_meta`/`fc_args` are read, not
-        // drained, because `response.completed` still needs them.
+        // log line, in output-index order. `tool_log` is drained; `fc_meta` /
+        // `fc_args` are not, because `response.completed` is built from them.
         if log_resp {
-            flush_open_tools(&fc_meta, &fc_args, &mut logged_tools, &reqlog);
+            flush_open_tools(&mut tool_log, &mut tool_line, &reqlog);
         }
         reqlog.done();
     }
 }
 
-/// Write out every tool call whose block never closed, in output-index order,
-/// recording each one in `logged_tools` so a second call cannot log it twice.
-/// Called both at the natural end of a stream and on the error path — the log
-/// line ends either way, and a call that already reached the client must not
-/// vanish from the record. The value maps are read, never drained:
-/// `response.completed` is built from them (FR-20).
+/// Write out every tool call whose block never closed, in output-index order.
+/// Each call is settled, so only the part not already on the log line is
+/// written. Called both at the natural end of a stream and on the error path —
+/// the log line ends either way, and a call that already reached the client must
+/// not vanish from the record. `fc_meta`/`fc_args` are untouched: `response.completed`
+/// is built from them (FR-20).
 fn flush_open_tools(
-    fc_meta: &std::collections::BTreeMap<usize, (String, String)>,
-    fc_args: &std::collections::BTreeMap<usize, String>,
-    logged_tools: &mut std::collections::HashSet<usize>,
+    tool_log: &mut std::collections::BTreeMap<usize, crate::reqlog::ToolCall>,
+    tool_line: &mut crate::reqlog::ToolLine<usize>,
     reqlog: &crate::reqlog::ReqLog,
 ) {
-    let pending: Vec<(usize, crate::reqlog::ToolCall)> = fc_meta
-        .iter()
-        .filter(|(oidx, _)| !logged_tools.contains(oidx))
-        .map(|(oidx, (_, name))| {
-            let args = fc_args.get(oidx).cloned().unwrap_or_default();
-            (*oidx, crate::reqlog::ToolCall::open(name, &args))
-        })
-        .collect();
-    for (oidx, _) in &pending {
-        logged_tools.insert(*oidx);
+    for (index, mut tool) in std::mem::take(tool_log) {
+        tool_line.settle_tool(&index, &mut tool, reqlog);
     }
-    crate::reqlog::append_markers(reqlog, pending.into_iter().map(|(_, call)| call));
 }
 
 /// Format a `event: <name>\ndata: <json>\n\n` SSE block.

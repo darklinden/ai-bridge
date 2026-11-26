@@ -578,10 +578,12 @@ where
         let mut chunk_id = 0u32;
         let current_model = model;
         let mut tool_index: usize = 0;
-        // Open tool blocks, keyed by their Anthropic content index. The `[RESP]`
-        // marker is written when the block closes, once its arguments are whole.
+        // Open tool blocks, keyed by their Anthropic content index. A block is
+        // streamed onto the `[RESP]` line while its arguments arrive; the line
+        // itself lets only one call write at a time (`ToolLine`).
         let mut open_tools: std::collections::HashMap<usize, crate::reqlog::ToolCall> =
             std::collections::HashMap::new();
+        let mut tool_line: crate::reqlog::ToolLine<usize> = Default::default();
         let mut usage_sent = false;
 
         tokio::pin!(stream);
@@ -639,7 +641,27 @@ where
                                             // block, and the log renders it `[tool_use: ?]`
                                             // rather than hiding the call.
                                             if log_resp {
-                                                open_tools.insert(idx, crate::reqlog::ToolCall::open(&name, ""));
+                                                // Head first, so a long argument stream shows
+                                                // which call is in flight; deltas follow below.
+                                                // A repeated start for the same block adopts the
+                                                // entry already tracking it instead of opening a
+                                                // second one, so its arguments stay with one head.
+                                                match open_tools.get_mut(&idx) {
+                                                    Some(existing) => {
+                                                        if existing.name.is_empty() {
+                                                            existing.name = name.to_string();
+                                                        }
+                                                        if !existing.is_streaming() {
+                                                            tool_line.begin_tool(&idx, existing, &reqlog);
+                                                        }
+                                                    }
+                                                    None => {
+                                                        let mut tool =
+                                                            crate::reqlog::ToolCall::open(&name, "");
+                                                        tool_line.begin_tool(&idx, &mut tool, &reqlog);
+                                                        open_tools.insert(idx, tool);
+                                                    }
+                                                }
                                             }
                                             tool_index = idx;
                                             let chunk = json!({
@@ -725,7 +747,7 @@ where
                                                 open_tools
                                                     .entry(tool_index)
                                                     .or_default()
-                                                    .push_args(partial);
+                                                    .stream_args(&reqlog, partial);
                                             }
                                             let chunk = json!({
                                                 "id": format!("chatcmpl-{}", chunk_id),
@@ -755,8 +777,8 @@ where
                                 // arguments were accumulated under in a conforming stream.
                                 let idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                                 if log_resp {
-                                    if let Some(tool) = open_tools.remove(&idx) {
-                                        reqlog.append(&tool.marker());
+                                    if let Some(mut tool) = open_tools.remove(&idx) {
+                                        tool_line.settle_tool(&idx, &mut tool, &reqlog);
                                     }
                                 }
                             }
@@ -801,7 +823,7 @@ where
                     if log_resp {
                         // `err_resp` closes the log line, so a tool call still
                         // open has to be written before it.
-                        crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
+                        crate::reqlog::flush_open_tools(&mut open_tools, &mut tool_line, &reqlog);
                         reqlog.err_resp(&format!("Stream error: {e}"));
                     }
                     break;
@@ -811,7 +833,7 @@ where
         // A tool block the upstream never closed still has its arguments on the
         // log line, in content-index order.
         if log_resp {
-            crate::reqlog::flush_open_tools(&mut open_tools, &reqlog);
+            crate::reqlog::flush_open_tools(&mut open_tools, &mut tool_line, &reqlog);
         }
         reqlog.done();
     }
@@ -1209,6 +1231,31 @@ mod tests {
         );
         assert!(
             logged.contains("[tool_use: read] {\"p\":\"b\"}"),
+            "log was: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_tool_start_keeps_one_head_for_the_call() {
+        // A replayed or non-conforming stream repeats `content_block_start` for
+        // the same block. The second one must adopt the entry already tracking
+        // it, not open a second head — otherwise the call's arguments end up
+        // split across two markers.
+        let frames = vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n".to_string(),
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"f\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"1}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ];
+        let logged = run_chat_sse_logged(frames, true).await;
+        assert_eq!(
+            logged.matches("[tool_use: f]").count(),
+            1,
+            "log was: {logged}"
+        );
+        assert!(
+            logged.contains("[tool_use: f] {\"a\":1}"),
             "log was: {logged}"
         );
     }

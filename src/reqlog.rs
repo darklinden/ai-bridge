@@ -78,12 +78,20 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 /// This is the single place the log spells a tool call, so the request line and
 /// every response path (streaming or not) render one identically.
 pub(crate) fn tool_use_marker(name: &str, args: &str) -> String {
-    let name = if name.is_empty() { "?" } else { name };
+    let head = tool_use_head(name);
     if args.is_empty() {
-        format!("[tool_use: {name}]")
+        head
     } else {
-        format!("[tool_use: {name}] {args}")
+        format!("{head} {args}")
     }
+}
+
+/// The head of a call's marker, `[tool_use: {name}]`, with `?` for an absent or
+/// empty name. Streamed calls put this on the line first and append their
+/// arguments behind it, so the head and the full marker are spelled together.
+pub(crate) fn tool_use_head(name: &str) -> String {
+    let name = if name.is_empty() { "?" } else { name };
+    format!("[tool_use: {name}]")
 }
 
 /// Render a tool result for the log: `[tool_result: {id}] {content}`.
@@ -102,13 +110,26 @@ pub(crate) fn tool_result_marker(id: &str, content: &str) -> String {
 /// An in-flight tool call: the name the upstream announced, plus the argument
 /// text accumulated from its deltas.
 ///
-/// A stream cannot render the marker when the block opens — the arguments only
-/// arrive afterwards — so it keeps one of these per open block and hands it to
-/// [`tool_use_marker`] when the block completes.
+/// A stream does not have to wait for the block to close before writing the
+/// call. As soon as the name is known, [`ToolCall::begin`] puts
+/// `[tool_use: {name}]` on the log line; while the call owns the line (see
+/// [`ToolLine`]) each argument delta reaches it through
+/// [`ToolCall::stream_args`], so a long tool call shows which call is in flight
+/// instead of leaving the line silent. [`ToolCall::settle`] writes whatever has
+/// not reached the line when the block closes. A call that never learns its name
+/// keeps buffering and is settled in one piece, exactly as before.
+///
+/// However the text arrives, a finished call reads `[tool_use: {name}] {args}`
+/// — the shape [`tool_use_marker`] renders — so the record is unchanged.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolCall {
     pub(crate) name: String,
     pub(crate) args: String,
+    /// Bytes of `args` already written after the head; `None` until the head is
+    /// out. The offset is always `0` or the `args.len()` of an earlier value, so
+    /// it stays a char boundary; `resolve_args` re-checks the printed prefix
+    /// before it replaces the text.
+    printed: Option<usize>,
 }
 
 impl ToolCall {
@@ -118,6 +139,7 @@ impl ToolCall {
         ToolCall {
             name: name.to_string(),
             args: args.to_string(),
+            printed: None,
         }
     }
 
@@ -130,10 +152,100 @@ impl ToolCall {
     /// rather than a delta. Whichever is longer wins: a stream that only sends
     /// the terminal frame has nothing accumulated, and a truncated delta run must
     /// not shrink what is already there.
+    ///
+    /// Once part of the call is on the log line it cannot be retracted, so a
+    /// terminal value is only accepted when it extends what was already written;
+    /// a contradictory one leaves the streamed text in place.
     pub(crate) fn resolve_args(&mut self, args: &str) {
-        if args.len() > self.args.len() {
-            self.args.clear();
-            self.args.push_str(args);
+        if args.len() <= self.args.len() {
+            return;
+        }
+        if let Some(printed) = self.printed {
+            let prefix = &self.args[..printed];
+            if !args.starts_with(prefix) {
+                return;
+            }
+        }
+        self.args.clear();
+        self.args.push_str(args);
+    }
+
+    /// The `[tool_use: {name}]` head, once, as soon as the name is known.
+    /// `None` afterwards, and for a nameless block — its `?` only ever appears
+    /// in the close-time marker.
+    pub(crate) fn begin_fragment(&mut self) -> Option<String> {
+        if self.printed.is_some() || self.name.is_empty() {
+            return None;
+        }
+        self.printed = Some(0);
+        Some(tool_use_head(&self.name))
+    }
+
+    /// The not-yet-written tail of the arguments: `" {args}"` for the first
+    /// bytes after the head, the raw remainder after that. `None` when nothing
+    /// is new or the head is not out yet.
+    pub(crate) fn tail_fragment(&mut self) -> Option<String> {
+        let printed = self.printed?;
+        debug_assert!(printed <= self.args.len(), "printed offset past the arguments");
+        let rest = &self.args[printed..];
+        if rest.is_empty() {
+            return None;
+        }
+        let fragment = if printed == 0 {
+            format!(" {rest}")
+        } else {
+            rest.to_string()
+        };
+        self.printed = Some(self.args.len());
+        Some(fragment)
+    }
+
+    /// Accumulate one delta and return the fragment that carries it to the log.
+    pub(crate) fn push_fragment(&mut self, delta: &str) -> Option<String> {
+        self.push_args(delta);
+        self.tail_fragment()
+    }
+
+    /// Finish the call, returning whatever is still missing from the log line —
+    /// the whole marker for a call that never started streaming, the argument
+    /// tail otherwise.
+    pub(crate) fn settle_fragment(&mut self) -> Option<String> {
+        if self.printed.is_none() {
+            let marker = self.marker();
+            self.printed = Some(self.args.len());
+            return Some(marker);
+        }
+        self.tail_fragment()
+    }
+
+    // --- the same three steps, writing to a `ReqLog` directly --------------
+
+    /// Put the head on the log line, once.
+    pub(crate) fn begin(&mut self, reqlog: &ReqLog) {
+        if let Some(fragment) = self.begin_fragment() {
+            reqlog.append(&fragment);
+        }
+    }
+
+    /// One argument delta arrives: accumulate it and, when this call owns the
+    /// line, append the new text. A call that never claimed the line only
+    /// accumulates — see [`ToolLine`] for why only one call may write.
+    pub(crate) fn stream_args(&mut self, reqlog: &ReqLog, delta: &str) {
+        self.push_args(delta);
+        if let Some(fragment) = self.tail_fragment() {
+            reqlog.append(&fragment);
+        }
+    }
+
+    /// Whether this call already has text on the log line.
+    pub(crate) fn is_streaming(&self) -> bool {
+        self.printed.is_some()
+    }
+
+    /// Write whatever has not reached the log line yet.
+    pub(crate) fn settle(&mut self, reqlog: &ReqLog) {
+        if let Some(fragment) = self.settle_fragment() {
+            reqlog.append(&fragment);
         }
     }
 
@@ -146,36 +258,122 @@ impl ToolCall {
     }
 }
 
-/// Write one marker per call, in the order given.
+/// Arbitration for one response line's tool text.
 ///
-/// This is the single place a flushed tool call reaches the log, so every path
-/// writes the vocabulary in the same shape.
-pub(crate) fn append_markers<I: IntoIterator<Item = ToolCall>>(reqlog: &ReqLog, calls: I) {
-    for call in calls {
-        reqlog.append(&call.marker());
+/// The line is append-only: once a call's arguments are on it, a second call
+/// cannot start writing without each one's text landing under the other's head.
+/// So exactly one call may own the line. A call that finds it busy keeps
+/// buffering; if it finishes before the owner, its finished marker waits in the
+/// backlog and is written the moment the line is released — so the line still
+/// ends up as a run of complete `[tool_use: {name}] {arguments}` markers, each
+/// call's arguments under its own head.
+///
+/// Sequential calls (the normal shape) never touch the backlog: each one claims
+/// the line when its block opens and releases it when the block closes.
+#[derive(Debug, Default)]
+pub(crate) struct ToolLine<K> {
+    active: Option<K>,
+    backlog: Vec<String>,
+}
+
+impl<K: PartialEq + Clone> ToolLine<K> {
+    /// Whether this call owns the line (it is the one writing).
+    pub(crate) fn owns(&self, key: &K) -> bool {
+        self.active.as_ref() == Some(key)
+    }
+
+    /// Whether any call owns the line (the caller checks [`ToolLine::owns`]
+    /// first when it needs "someone else").
+    pub(crate) fn is_busy(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Claim the line for `key` when it is free. `false` means the call must
+    /// stay buffered and settle in one piece later.
+    pub(crate) fn claim(&mut self, key: K) -> bool {
+        if self.active.is_some() {
+            return false;
+        }
+        self.active = Some(key);
+        true
+    }
+
+    /// A finished call that could not write: hold its text until the line frees.
+    pub(crate) fn hold(&mut self, text: String) {
+        self.backlog.push(text);
+    }
+
+    /// Give the line back, returning the finished calls that were waiting for it.
+    /// A key that does not own the line gets nothing: releasing on its behalf
+    /// would put held text under someone else's call.
+    pub(crate) fn release(&mut self, key: &K) -> Vec<String> {
+        if self.active.as_ref() != Some(key) {
+            return Vec::new();
+        }
+        self.active = None;
+        std::mem::take(&mut self.backlog)
+    }
+
+    /// Start `tool`'s entry on the line if the line is free, so a long call is
+    /// visible while it streams. Returns whether the call now owns the line.
+    ///
+    /// A nameless call never claims: it has no head to write, so holding the line
+    /// would only keep every other call from streaming.
+    pub(crate) fn begin_tool(&mut self, key: &K, tool: &mut ToolCall, reqlog: &ReqLog) -> bool {
+        if self.owns(key) {
+            tool.begin(reqlog);
+            return true;
+        }
+        if tool.name.is_empty() || !self.claim(key.clone()) {
+            return false;
+        }
+        tool.begin(reqlog);
+        true
+    }
+
+    /// Finish `tool`: write it now when the line is free or this call owns it,
+    /// otherwise hold its finished marker until the owner releases the line.
+    pub(crate) fn settle_tool(&mut self, key: &K, tool: &mut ToolCall, reqlog: &ReqLog) {
+        if self.owns(key) {
+            tool.settle(reqlog);
+            for waiting in self.release(key) {
+                reqlog.append(&waiting);
+            }
+            return;
+        }
+        if !self.is_busy() {
+            tool.settle(reqlog);
+            return;
+        }
+        if let Some(finished) = tool.settle_fragment() {
+            self.backlog.push(finished);
+        }
     }
 }
 
 /// Drain an index-keyed map of calls still waiting for their block to close,
-/// writing them in key order.
+/// settling them in key order (each writes only what is not on the line yet;
+/// the line's owner, when one is among them, settles first and lets the rest
+/// follow).
 ///
 /// Called both at the natural end of a stream and on the error path — the log
 /// line ends either way, and a call that already reached the client must not
 /// vanish from the record.
 pub(crate) fn flush_open_tools<K, S>(
     open: &mut std::collections::HashMap<K, ToolCall, S>,
+    line: &mut ToolLine<K>,
     reqlog: &ReqLog,
 ) where
-    K: Ord + Copy + Eq + std::hash::Hash,
+    K: Ord + Copy + Eq + Clone + std::hash::Hash,
     S: std::hash::BuildHasher,
 {
     let mut leftover: Vec<K> = open.keys().copied().collect();
     leftover.sort_unstable();
-    let calls: Vec<ToolCall> = leftover
-        .into_iter()
-        .filter_map(|key| open.remove(&key))
-        .collect();
-    append_markers(reqlog, calls);
+    for key in leftover {
+        if let Some(mut call) = open.remove(&key) {
+            line.settle_tool(&key, &mut call, reqlog);
+        }
+    }
 }
 
 pub struct ReqLog {
@@ -352,6 +550,182 @@ mod tests {
     }
 
     #[test]
+    fn a_streamed_call_reproduces_the_marker_byte_for_byte() {
+        let (log, buf) = ReqLog::captured();
+        log.resp_header("");
+        let mut call = ToolCall::open("bash", "");
+        call.begin(&log);
+        call.stream_args(&log, "{\"cmd\":");
+        call.stream_args(&log, "\"ls\"}");
+        call.settle(&log);
+
+        let text = buf.lock().unwrap().clone();
+        assert!(
+            text.ends_with("[tool_use: bash] {\"cmd\":\"ls\"}"),
+            "log was: {text}"
+        );
+        // Settling a finished call must not repeat any of it.
+        let len = text.len();
+        call.settle(&log);
+        assert_eq!(buf.lock().unwrap().len(), len);
+    }
+
+    #[test]
+    fn a_nameless_call_streams_nothing_until_it_settles() {
+        let (log, buf) = ReqLog::captured();
+        log.resp_header("");
+        let mut call = ToolCall::open("", "");
+        call.stream_args(&log, "{\"a\":1}");
+        // No name, no head — the text waits rather than opening a `[tool_use: ]`.
+        let text = buf.lock().unwrap().clone();
+        assert!(!text.contains("[tool_use"), "log was: {text}");
+
+        // A name that arrives late still lets everything already collected out.
+        call.name = "f".to_string();
+        call.stream_args(&log, "{\"b\":2}");
+        call.settle(&log);
+        let text = buf.lock().unwrap().clone();
+        assert!(
+            text.ends_with("[tool_use: f] {\"a\":1}{\"b\":2}"),
+            "log was: {text}"
+        );
+    }
+
+    #[test]
+    fn resolve_args_cannot_rewrite_what_is_already_on_the_line() {
+        let (log, buf) = ReqLog::captured();
+        log.resp_header("");
+        let mut call = ToolCall::open("f", "");
+        call.begin(&log);
+        call.stream_args(&log, "{\"a\":1");
+
+        // Shorter than the deltas: ignored, the deltas are the fuller record.
+        call.resolve_args("{}");
+        // A terminal value that extends the printed prefix fills in the rest —
+        // the truncated-delta case.
+        call.resolve_args("{\"a\":1}");
+        call.settle(&log);
+        let text = buf.lock().unwrap().clone();
+        assert!(text.ends_with("[tool_use: f] {\"a\":1}"), "log was: {text}");
+
+        // A different document cannot retract what is already written, so the
+        // streamed text stays as it was.
+        call.resolve_args("{\"a\":1,\"b\":2}");
+        call.settle(&log);
+        let text = buf.lock().unwrap().clone();
+        assert!(text.ends_with("[tool_use: f] {\"a\":1}"), "log was: {text}");
+        assert!(!text.contains("\"b\""), "log was: {text}");
+    }
+
+    #[test]
+    fn one_call_at_a_time_owns_the_line() {
+        let (log, buf) = ReqLog::captured();
+        log.resp_header("");
+        let mut line: ToolLine<u32> = ToolLine::default();
+        let mut first = ToolCall::open("first", "");
+        let mut second = ToolCall::open("second", "");
+
+        assert!(line.begin_tool(&0, &mut first, &log));
+        // The line is taken: the second call must not write its head yet.
+        assert!(!line.begin_tool(&1, &mut second, &log));
+        first.stream_args(&log, "{\"a\":");
+        second.stream_args(&log, "{\"b\":2}");
+
+        // The second one finishes first and waits for the line.
+        line.settle_tool(&1, &mut second, &log);
+        let text = buf.lock().unwrap().clone();
+        assert!(!text.contains("second"), "log was: {text}");
+
+        // Closing the owner writes its tail, then releases the line for the
+        // waiting call, which lands complete and after it.
+        first.stream_args(&log, "1}");
+        line.settle_tool(&0, &mut first, &log);
+        let text = buf.lock().unwrap().clone();
+        assert!(
+            text.ends_with("[tool_use: first] {\"a\":1}[tool_use: second] {\"b\":2}"),
+            "log was: {text}"
+        );
+    }
+
+    #[test]
+    fn a_nameless_call_does_not_hold_the_line() {
+        let (log, buf) = ReqLog::captured();
+        log.resp_header("");
+        let mut line: ToolLine<u32> = ToolLine::default();
+        let mut nameless = ToolCall::open("", "");
+        let mut named = ToolCall::open("f", "");
+
+        // No head to write, so the nameless call must not take the line.
+        assert!(!line.begin_tool(&0, &mut nameless, &log));
+        assert!(line.begin_tool(&1, &mut named, &log));
+        named.stream_args(&log, "{}");
+
+        // The nameless call closes first: it waits, then lands behind the call
+        // that owns the line.
+        nameless.push_args("{\"a\":1}");
+        line.settle_tool(&0, &mut nameless, &log);
+        line.settle_tool(&1, &mut named, &log);
+
+        let text = buf.lock().unwrap().clone();
+        assert!(
+            text.ends_with("[tool_use: f] {}[tool_use: ?] {\"a\":1}"),
+            "log was: {text}"
+        );
+    }
+
+    #[test]
+    fn three_calls_keep_their_own_arguments() {
+        let (log, buf) = ReqLog::captured();
+        log.resp_header("");
+        let mut line: ToolLine<u32> = ToolLine::default();
+        let mut a = ToolCall::open("a", "");
+        let mut b = ToolCall::open("b", "");
+        let mut c = ToolCall::open("c", "");
+
+        assert!(line.begin_tool(&0, &mut a, &log));
+        assert!(!line.begin_tool(&1, &mut b, &log));
+        assert!(!line.begin_tool(&2, &mut c, &log));
+        a.stream_args(&log, "{\"a\":");
+        b.stream_args(&log, "{\"b\":2}");
+        c.stream_args(&log, "{\"c\":3}");
+
+        // Both later calls finish first; they queue in that order.
+        line.settle_tool(&1, &mut b, &log);
+        line.settle_tool(&2, &mut c, &log);
+
+        a.stream_args(&log, "1}");
+        line.settle_tool(&0, &mut a, &log);
+
+        let text = buf.lock().unwrap().clone();
+        assert!(
+            text.ends_with(
+                "[tool_use: a] {\"a\":1}[tool_use: b] {\"b\":2}[tool_use: c] {\"c\":3}"
+            ),
+            "log was: {text}"
+        );
+    }
+
+    #[test]
+    fn a_sequential_call_takes_the_line_after_the_previous_one() {
+        let (log, buf) = ReqLog::captured();
+        log.resp_header("");
+        let mut line: ToolLine<u32> = ToolLine::default();
+
+        let mut first = ToolCall::open("first", "");
+        assert!(line.begin_tool(&0, &mut first, &log));
+        first.stream_args(&log, "{}");
+        line.settle_tool(&0, &mut first, &log);
+
+        let mut second = ToolCall::open("second", "");
+        assert!(line.begin_tool(&1, &mut second, &log));
+        second.stream_args(&log, "{}");
+        line.settle_tool(&1, &mut second, &log);
+
+        let text = buf.lock().unwrap().clone();
+        assert!(text.ends_with("[tool_use: first] {}[tool_use: second] {}"), "log was: {text}");
+    }
+
+    #[test]
     fn flush_open_tools_writes_every_call_in_key_order() {
         let (reqlog, buf) = ReqLog::captured();
         reqlog.resp_header("");
@@ -360,7 +734,8 @@ mod tests {
         open.insert(2, ToolCall::open("c", "{}"));
         open.insert(0, ToolCall::open("a", "{}"));
         open.insert(1, ToolCall::open("b", "{}"));
-        flush_open_tools(&mut open, &reqlog);
+        let mut line: ToolLine<u32> = ToolLine::default();
+        flush_open_tools(&mut open, &mut line, &reqlog);
         reqlog.done();
 
         assert!(open.is_empty(), "the flush must drain the map");

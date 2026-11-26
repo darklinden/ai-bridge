@@ -4,8 +4,10 @@
 //! in `server.rs`), bytes are forwarded verbatim. This module wraps that byte
 //! stream solely to append the streamed response text onto the shared
 //! `[RESP #id]: ` log line — it never alters the forwarded bytes. Each frame is
-//! parsed just enough to extract loggable text fragments per upstream format,
-//! and the original `Bytes` chunks are re-yielded unchanged.
+//! parsed just enough to extract loggable fragments per upstream format, and the
+//! original `Bytes` chunks are re-yielded unchanged. A tool call is logged the
+//! same way its text is: the head when the block is named, each argument delta as
+//! it arrives.
 
 use crate::error::LocalEntry;
 use crate::reqlog::{ReqLog, ToolCall};
@@ -39,14 +41,18 @@ impl StreamFormat {
 /// block identifier (Anthropic content index, Chat `tool_calls[].index`, or
 /// Responses item id).
 ///
-/// A tool call cannot be logged when its block opens — the arguments only arrive
-/// as later deltas — so each one is recorded here and rendered as a complete
-/// `[tool_use: name] {arguments}` marker when its block closes. Keying per block
-/// (rather than de-duplicating by name) also keeps parallel calls of the same
-/// tool from hiding each other.
+/// A block is recorded here the moment it is named: the head goes onto the log
+/// line then and each argument delta follows, so a long call is visible while it
+/// streams. The tracker also decides who may write (see `reqlog::ToolLine`), and
+/// a call that never announces its name is rendered as one complete
+/// `[tool_use: ?] {arguments}` marker at its close. Keying per block (rather than
+/// de-duplicating by name) also keeps parallel calls of the same tool from
+/// hiding each other.
 #[derive(Default)]
 struct ToolLogState {
     open: HashMap<String, ToolCall>,
+    /// Which call may write to the line (see `reqlog::ToolLine`).
+    line: crate::reqlog::ToolLine<String>,
     /// Argument deltas seen for a block that has not announced its name yet. A
     /// provider that sends `arguments` before `name` would otherwise lose them.
     pending: HashMap<String, String>,
@@ -55,64 +61,100 @@ struct ToolLogState {
 }
 
 impl ToolLogState {
-    /// Record a tool block that just opened. Idempotent: a repeated opening frame
-    /// keeps whatever has already been accumulated, and arguments that arrived
-    /// before the name are folded in.
-    fn open(&mut self, key: &str, name: &str, args: &str) {
+    /// Record a tool block that just opened, returning the fragments that put its
+    /// head — and any arguments already known — onto the log line. Idempotent: a
+    /// repeated opening frame keeps whatever has already been accumulated.
+    ///
+    /// A block that has not announced its name emits nothing here: it keeps
+    /// buffering and its close-time marker renders the `?`.
+    fn open(&mut self, key: &str, name: &str, args: &str) -> Vec<String> {
         let buffered = self.pending.remove(key).unwrap_or_default();
-        if let Some(existing) = self.open.get_mut(key) {
-            if existing.name.is_empty() {
-                existing.name = name.to_string();
-            }
-            existing.push_args(&buffered);
-            existing.push_args(args);
-            return;
+        if !self.open.contains_key(key) {
+            self.open.insert(key.to_string(), ToolCall::open(name, ""));
+            self.order.push(key.to_string());
         }
-        self.open.insert(
-            key.to_string(),
-            ToolCall::open(name, &format!("{buffered}{args}")),
-        );
-        self.order.push(key.to_string());
+        let Some(call) = self.open.get_mut(key) else {
+            return Vec::new();
+        };
+        if call.name.is_empty() {
+            call.name = name.to_string();
+        }
+        call.push_args(&buffered);
+        call.push_args(args);
+        // Only one call may have text on the line at a time; a call that finds
+        // it busy keeps buffering and is written whole by `close`.
+        let owned_key = key.to_string();
+        if !self.line.owns(&owned_key) && !self.line.claim(owned_key) {
+            return Vec::new();
+        }
+        let mut frags = Vec::new();
+        if let Some(frag) = call.begin_fragment() {
+            frags.push(frag);
+        }
+        if let Some(frag) = call.tail_fragment() {
+            frags.push(frag);
+        }
+        frags
     }
 
-    /// Append one argument delta to an open block. A delta for a block that has
-    /// not announced its name yet is buffered until it does.
-    fn push_args(&mut self, key: &str, delta: &str) {
-        if let Some(tool) = self.open.get_mut(key) {
-            tool.push_args(delta);
-        } else {
-            self.pending
-                .entry(key.to_string())
-                .or_default()
-                .push_str(delta);
+    /// Append one argument delta to an open block, returning what reaches the log
+    /// line now. A delta for a block that has not announced its name yet is
+    /// buffered until it does.
+    fn push_args(&mut self, key: &str, delta: &str) -> Option<String> {
+        match self.open.get_mut(key) {
+            Some(tool) => tool.push_fragment(delta),
+            None => {
+                self.pending
+                    .entry(key.to_string())
+                    .or_default()
+                    .push_str(delta);
+                None
+            }
         }
     }
 
     /// Take an authoritative whole-arguments value from a terminal frame. The
     /// Responses `function_call_arguments.done` event carries the complete
     /// argument string, so a stream that emits it without deltas still logs them.
-    fn resolve_args(&mut self, key: &str, args: &str) {
-        if let Some(tool) = self.open.get_mut(key) {
-            tool.resolve_args(args);
-        }
+    fn resolve_args(&mut self, key: &str, args: &str) -> Option<String> {
+        let tool = self.open.get_mut(key)?;
+        tool.resolve_args(args);
+        tool.tail_fragment()
     }
 
-    /// Finish a tool block, returning its complete marker. `None` when the block
-    /// was never opened.
-    fn close(&mut self, key: &str) -> Option<String> {
+    /// Finish a tool block, returning the fragments it still owes the log line —
+    /// the whole marker for a block that never announced its name, plus any
+    /// finished calls that were queued behind it.
+    fn close(&mut self, key: &str) -> Vec<String> {
         // Drop any argument text buffered for a block that never announced its
         // name, so a later block reusing the key cannot inherit it.
         self.pending.remove(key);
-        let tool = self.open.remove(key)?;
+        let Some(mut tool) = self.open.remove(key) else {
+            return Vec::new();
+        };
         self.order.retain(|k| k != key);
-        Some(tool.marker())
+        let owned_key = key.to_string();
+        if self.line.owns(&owned_key) {
+            let mut frags: Vec<String> = tool.settle_fragment().into_iter().collect();
+            frags.extend(self.line.release(&owned_key));
+            return frags;
+        }
+        if self.line.is_busy() {
+            // Another call owns the line: hold this finished marker until it is
+            // released, so neither call's text lands under the other's head.
+            if let Some(finished) = tool.settle_fragment() {
+                self.line.hold(finished);
+            }
+            return Vec::new();
+        }
+        tool.settle_fragment().into_iter().collect()
     }
 
     /// Finish every block still open (a stream that ended mid-tool, or a Chat
     /// stream whose terminal `finish_reason` frame closed them all at once).
     fn close_all(&mut self) -> Vec<String> {
         let keys = std::mem::take(&mut self.order);
-        keys.iter().filter_map(|key| self.close(key)).collect()
+        keys.iter().flat_map(|key| self.close(key)).collect()
     }
 }
 
@@ -128,9 +170,9 @@ fn anthropic_key(value: &Value) -> String {
 /// Extract the loggable fragments from one SSE `data:` JSON value. An empty
 /// result means the frame carries nothing loggable.
 ///
-/// `tools` carries the in-flight tool calls across frames: a block's marker can
-/// only be written once its arguments have all arrived, which is at its closing
-/// frame, not its opening one.
+/// `tools` carries the in-flight tool calls across frames: the head has to wait
+/// for the name and the arguments for their deltas, so the tracker hands back
+/// whatever is ready to be written *now* rather than one finished marker.
 fn extract_log_fragment(
     format: StreamFormat,
     value: &Value,
@@ -147,7 +189,7 @@ fn extract_log_fragment(
                         .unwrap_or("");
                     // A block the upstream never named still reached the client,
                     // so it is tracked and logged as `[tool_use: ?]`.
-                    tools.open(&anthropic_key(value), name, "");
+                    return tools.open(&anthropic_key(value), name, "");
                 }
                 Vec::new()
             }
@@ -164,17 +206,17 @@ fn extract_log_fragment(
                         .map(|text| vec![text.to_string()])
                         .unwrap_or_default(),
                     Some("input_json_delta") => {
-                        if let Some(partial) =
-                            value.pointer("/delta/partial_json").and_then(Value::as_str)
-                        {
-                            tools.push_args(&anthropic_key(value), partial);
-                        }
-                        Vec::new()
+                        value
+                            .pointer("/delta/partial_json")
+                            .and_then(Value::as_str)
+                            .and_then(|partial| tools.push_args(&anthropic_key(value), partial))
+                            .into_iter()
+                            .collect()
                     }
                     _ => Vec::new(),
                 }
             }
-            Some("content_block_stop") => tools.close(&anthropic_key(value)).into_iter().collect(),
+            Some("content_block_stop") => tools.close(&anthropic_key(value)),
             _ => Vec::new(),
         },
 
@@ -212,12 +254,12 @@ fn extract_log_fragment(
                         // An empty name stays replaceable: a later frame that
                         // spells it fills it in (`ToolLogState::open`).
                         if let Some(name) = tc.pointer("/function/name").and_then(Value::as_str) {
-                            tools.open(&key, name, "");
+                            frags.extend(tools.open(&key, name, ""));
                         }
                         if let Some(args) =
                             tc.pointer("/function/arguments").and_then(Value::as_str)
                         {
-                            tools.push_args(&key, args);
+                            frags.extend(tools.push_args(&key, args));
                         }
                     }
                 }
@@ -255,29 +297,33 @@ fn extract_log_fragment(
                         // A nameless block is tracked too (the client gets the same
                         // one); only a keyless frame cannot be tracked at all.
                         if !key.is_empty() {
-                            tools.open(key, name, "");
+                            return tools.open(key, name, "");
                         }
                     }
                     Vec::new()
                 }
                 Some("response.function_call_arguments.delta") => {
                     let key = value.get("item_id").and_then(Value::as_str).unwrap_or("");
-                    if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                        tools.push_args(key, delta);
-                    }
-                    Vec::new()
+                    value
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .and_then(|delta| tools.push_args(key, delta))
+                        .into_iter()
+                        .collect()
                 }
                 Some("response.function_call_arguments.done") => {
                     let key = value.get("item_id").and_then(Value::as_str).unwrap_or("");
-                    if let Some(args) = value.get("arguments").and_then(Value::as_str) {
-                        tools.resolve_args(key, args);
-                    }
-                    Vec::new()
+                    value
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|args| tools.resolve_args(key, args))
+                        .into_iter()
+                        .collect()
                 }
                 Some("response.output_item.done") => {
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let key = item.get("id").and_then(Value::as_str).unwrap_or("");
-                        return tools.close(key).into_iter().collect();
+                        return tools.close(key);
                     }
                     Vec::new()
                 }
@@ -385,6 +431,12 @@ mod tests {
             .collect()
     }
 
+    /// The fragments a frame sequence produces, concatenated — exactly the text
+    /// that would land on the `[RESP]` line.
+    fn run_joined(format: StreamFormat, frames: &[Value]) -> String {
+        run(format, frames).concat()
+    }
+
     // -----------------------------------------------------------------------
     // extract_log_fragment — text and reasoning
     // -----------------------------------------------------------------------
@@ -469,16 +521,30 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn anthropic_tool_marker_is_written_at_block_close_with_its_arguments() {
+    fn anthropic_tool_call_puts_its_head_out_before_its_arguments() {
+        // The point of streaming a call: the head reaches the line while the
+        // arguments are still arriving, so an operator sees which call is in
+        // flight instead of a silent line.
         let frames = anthropic_tool_frames("get_weather", "{\"city\":\"SF\"}");
+        let mut tools = ToolLogState::default();
         assert_eq!(
-            run(StreamFormat::Anthropic, &frames),
-            vec!["[tool_use: get_weather] {\"city\":\"SF\"}".to_string()]
+            extract_log_fragment(StreamFormat::Anthropic, &frames[0], &mut tools),
+            vec!["[tool_use: get_weather]".to_string()]
+        );
+        assert_eq!(
+            extract_log_fragment(StreamFormat::Anthropic, &frames[1], &mut tools),
+            vec![" {\"city\":\"SF\"}".to_string()]
+        );
+        // The closing frame has nothing left to add.
+        assert!(extract_log_fragment(StreamFormat::Anthropic, &frames[2], &mut tools).is_empty());
+        assert_eq!(
+            run_joined(StreamFormat::Anthropic, &frames),
+            "[tool_use: get_weather] {\"city\":\"SF\"}"
         );
     }
 
     #[test]
-    fn anthropic_tool_arguments_accumulate_across_deltas() {
+    fn anthropic_tool_arguments_arriving_in_several_deltas_each_reach_the_line() {
         let frames = vec![
             json!({"type":"content_block_start","index":2,
                    "content_block":{"type":"tool_use","id":"t_1","name":"bash"}}),
@@ -488,10 +554,10 @@ mod tests {
                    "delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}),
             json!({"type":"content_block_stop","index":2}),
         ];
-        assert_eq!(
-            run(StreamFormat::Anthropic, &frames),
-            vec!["[tool_use: bash] {\"cmd\":\"ls\"}".to_string()]
-        );
+        let frags = run(StreamFormat::Anthropic, &frames);
+        // Head, then one fragment per delta — never the whole call at the end.
+        assert_eq!(frags.len(), 3, "fragments: {frags:?}");
+        assert_eq!(frags.concat(), "[tool_use: bash] {\"cmd\":\"ls\"}");
     }
 
     #[test]
@@ -501,15 +567,14 @@ mod tests {
                    "content_block":{"type":"tool_use","id":"t_1","name":"ping"}}),
             json!({"type":"content_block_stop","index":0}),
         ];
-        assert_eq!(
-            run(StreamFormat::Anthropic, &frames),
-            vec!["[tool_use: ping]".to_string()]
-        );
+        assert_eq!(run_joined(StreamFormat::Anthropic, &frames), "[tool_use: ping]");
     }
 
     #[test]
     fn anthropic_parallel_calls_of_the_same_tool_are_both_logged() {
-        // De-duplicating by name (the old behaviour) hid the second call.
+        // De-duplicating by name (the old behaviour) hid the second call. Each
+        // call now reaches the line where its own text arrives, so both keep
+        // their own arguments.
         let frames = vec![
             json!({"type":"content_block_start","index":0,
                    "content_block":{"type":"tool_use","id":"t_1","name":"read"}}),
@@ -523,16 +588,38 @@ mod tests {
             json!({"type":"content_block_stop","index":0}),
         ];
         assert_eq!(
-            run(StreamFormat::Anthropic, &frames),
-            vec![
-                "[tool_use: read] {\"p\":\"b\"}".to_string(),
-                "[tool_use: read] {\"p\":\"a\"}".to_string(),
-            ]
+            run_joined(StreamFormat::Anthropic, &frames),
+            "[tool_use: read] {\"p\":\"a\"}[tool_use: read] {\"p\":\"b\"}"
         );
     }
 
     #[test]
-    fn chat_tool_marker_waits_for_the_finish_reason_frame() {
+    fn a_call_that_finishes_first_waits_for_the_line() {
+        // Parallel calls: the second one opens while the first still streams and
+        // closes before it. Its marker must wait until the first call's
+        // arguments are complete, or the two would be spliced together.
+        let frames = vec![
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"tool_use","id":"t_0","name":"first"}}),
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}),
+            json!({"type":"content_block_start","index":1,
+                   "content_block":{"type":"tool_use","id":"t_1","name":"second"}}),
+            json!({"type":"content_block_delta","index":1,
+                   "delta":{"type":"input_json_delta","partial_json":"{\"b\":2}"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"input_json_delta","partial_json":"1}"}}),
+            json!({"type":"content_block_stop","index":0}),
+        ];
+        assert_eq!(
+            run_joined(StreamFormat::Anthropic, &frames),
+            "[tool_use: first] {\"a\":1}[tool_use: second] {\"b\":2}"
+        );
+    }
+
+    #[test]
+    fn chat_tool_call_streams_before_the_finish_reason_frame() {
         let frames = vec![
             json!({"id":"1","choices":[{"delta":{"tool_calls":[
                 {"index":0,"function":{"name":"f","arguments":""}}]}}]}),
@@ -540,10 +627,13 @@ mod tests {
                 {"index":0,"function":{"arguments":"{\"a\":1}"}}]}}]}),
             json!({"id":"1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
         ];
+        // Head at the opening frame, arguments at the delta, nothing at finish.
+        let frags = run(StreamFormat::Chat, &frames);
         assert_eq!(
-            run(StreamFormat::Chat, &frames),
-            vec!["[tool_use: f] {\"a\":1}".to_string()]
+            frags,
+            vec!["[tool_use: f]".to_string(), " {\"a\":1}".to_string()]
         );
+        assert_eq!(frags.concat(), "[tool_use: f] {\"a\":1}");
     }
 
     #[test]
@@ -553,10 +643,7 @@ mod tests {
                 {"function":{"name":"f","arguments":"{}"}}]}}]}),
             json!({"id":"1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
         ];
-        assert_eq!(
-            run(StreamFormat::Chat, &frames),
-            vec!["[tool_use: f] {}".to_string()]
-        );
+        assert_eq!(run_joined(StreamFormat::Chat, &frames), "[tool_use: f] {}");
     }
 
     #[test]
@@ -569,13 +656,13 @@ mod tests {
             json!({"id":"1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
         ];
         assert_eq!(
-            run(StreamFormat::Chat, &frames),
-            vec!["Let me check.".to_string(), "[tool_use: f] {}".to_string()]
+            run_joined(StreamFormat::Chat, &frames),
+            "Let me check.[tool_use: f] {}"
         );
     }
 
     #[test]
-    fn responses_tool_marker_is_written_at_output_item_done() {
+    fn responses_tool_call_streams_from_the_item_added_frame() {
         let frames = vec![
             json!({"type":"response.output_item.added","item":{
                 "id":"fc_1","type":"function_call","call_id":"call_1","name":"get_weather"}}),
@@ -586,9 +673,18 @@ mod tests {
             json!({"type":"response.output_item.done","item":{
                 "id":"fc_1","type":"function_call","call_id":"call_1","name":"get_weather"}}),
         ];
+        let frags = run(StreamFormat::Responses, &frames);
         assert_eq!(
-            run(StreamFormat::Responses, &frames),
-            vec!["[tool_use: get_weather] {\"city\":\"SF\"}".to_string()]
+            frags,
+            vec![
+                "[tool_use: get_weather]".to_string(),
+                " {\"city\":".to_string(),
+                "\"SF\"}".to_string(),
+            ]
+        );
+        assert_eq!(
+            frags.concat(),
+            "[tool_use: get_weather] {\"city\":\"SF\"}"
         );
     }
 
@@ -605,8 +701,8 @@ mod tests {
                 "id":"fc_1","type":"function_call","call_id":"call_1","name":"f"}}),
         ];
         assert_eq!(
-            run(StreamFormat::Responses, &frames),
-            vec!["[tool_use: f] {\"a\":1}".to_string()]
+            run_joined(StreamFormat::Responses, &frames),
+            "[tool_use: f] {\"a\":1}"
         );
     }
 
@@ -638,15 +734,16 @@ mod tests {
                 "id":"fc_1","type":"function_call","call_id":"call_1","name":"f"}}),
         ];
         assert_eq!(
-            run(StreamFormat::Responses, &frames),
-            vec!["[tool_use: f] {\"a\":1}".to_string()]
+            run_joined(StreamFormat::Responses, &frames),
+            "[tool_use: f] {\"a\":1}"
         );
     }
 
     #[test]
     fn anthropic_tool_block_without_a_name_is_logged_as_a_question_mark() {
         // The client received the block, so the log records it even though the
-        // upstream never spelled a name.
+        // upstream never spelled a name. A nameless block buffers and settles as
+        // one marker: there is no head to stream.
         let frames = vec![
             json!({"type":"content_block_start","index":0,
                    "content_block":{"type":"tool_use","id":"t_1"}}),
@@ -655,8 +752,8 @@ mod tests {
             json!({"type":"content_block_stop","index":0}),
         ];
         assert_eq!(
-            run(StreamFormat::Anthropic, &frames),
-            vec!["[tool_use: ?] {\"a\":1}".to_string()]
+            run_joined(StreamFormat::Anthropic, &frames),
+            "[tool_use: ?] {\"a\":1}"
         );
     }
 
@@ -668,8 +765,8 @@ mod tests {
             json!({"id":"1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
         ];
         assert_eq!(
-            run(StreamFormat::Chat, &frames),
-            vec!["[tool_use: ?] {\"a\":1}".to_string()]
+            run_joined(StreamFormat::Chat, &frames),
+            "[tool_use: ?] {\"a\":1}"
         );
     }
 
@@ -682,14 +779,18 @@ mod tests {
                 {"index":0,"function":{"name":"f"}}]}}]}),
             json!({"id":"1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
         ];
+        // The arguments were buffered, so they leave with the head once the name
+        // arrives — still before the turn's finish frame.
         assert_eq!(
-            run(StreamFormat::Chat, &frames),
-            vec!["[tool_use: f] {\"a\":1}".to_string()]
+            run_joined(StreamFormat::Chat, &frames),
+            "[tool_use: f] {\"a\":1}"
         );
     }
 
     #[test]
-    fn close_all_flushes_calls_left_open_by_a_truncated_stream() {
+    fn a_truncated_stream_leaves_nothing_unsaid() {
+        // A named call has already put its head and arguments on the line, so the
+        // flush at the end of the stream has nothing left to write.
         let mut tools = ToolLogState::default();
         extract_log_fragment(
             StreamFormat::Anthropic,
@@ -703,8 +804,25 @@ mod tests {
                     "delta":{"type":"input_json_delta","partial_json":"{}"}}),
             &mut tools,
         );
-        assert_eq!(tools.close_all(), vec!["[tool_use: f] {}".to_string()]);
-        // Closing twice must not duplicate the marker.
+        assert!(tools.close_all().is_empty());
+        assert!(tools.close_all().is_empty());
+
+        // A call that never learned its name could not stream, so the flush is
+        // where it reaches the line — once.
+        let mut tools = ToolLogState::default();
+        extract_log_fragment(
+            StreamFormat::Anthropic,
+            &json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":"tool_use","id":"t_1"}}),
+            &mut tools,
+        );
+        extract_log_fragment(
+            StreamFormat::Anthropic,
+            &json!({"type":"content_block_delta","index":0,
+                    "delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            &mut tools,
+        );
+        assert_eq!(tools.close_all(), vec!["[tool_use: ?] {}".to_string()]);
         assert!(tools.close_all().is_empty());
     }
 
